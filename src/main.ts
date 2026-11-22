@@ -47,6 +47,11 @@ async function loadSettings(): Promise<AppSettings> {
     const devKey = (import.meta.env.VITE_STT_API_KEY as string) || ''
     if (devKey) s.apiKey = devKey
   }
+  // Dev-only: `?target=ja` overrides the translation target (used by sim/run.sh).
+  if (import.meta.env.DEV) {
+    const t = new URLSearchParams(location.search).get('target')
+    if (t !== null) s.targetLang = t
+  }
   return s
 }
 

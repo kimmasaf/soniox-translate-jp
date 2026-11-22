@@ -58,11 +58,18 @@ if (!key) {
   process.exit(1)
 }
 
-console.log(`Synthesizing speech${VOICE ? ` (voice ${VOICE})` : ''}: "${TEXT}"`)
-const voiceArg = VOICE ? `-v ${JSON.stringify(VOICE)} ` : ''
-execSync(`say ${voiceArg}-o /tmp/soniox-test.aiff ${JSON.stringify(TEXT)}`)
-execSync('afconvert /tmp/soniox-test.aiff -d LEI16@16000 -c 1 -f WAVE /tmp/soniox-test.wav')
-const pcm = pcmFromWav(readFileSync('/tmp/soniox-test.wav'))
+// AUDIO_FILE=test-audio/ja.wav → stream an existing 16 kHz mono s16le WAV
+// instead of synthesizing with macOS `say` (works on Linux).
+const AUDIO_FILE = (process.env.AUDIO_FILE || '').trim()
+if (AUDIO_FILE) {
+  console.log(`Using audio file: ${AUDIO_FILE}`)
+} else {
+  console.log(`Synthesizing speech${VOICE ? ` (voice ${VOICE})` : ''}: "${TEXT}"`)
+  const voiceArg = VOICE ? `-v ${JSON.stringify(VOICE)} ` : ''
+  execSync(`say ${voiceArg}-o /tmp/soniox-test.aiff ${JSON.stringify(TEXT)}`)
+  execSync('afconvert /tmp/soniox-test.aiff -d LEI16@16000 -c 1 -f WAVE /tmp/soniox-test.wav')
+}
+const pcm = pcmFromWav(readFileSync(AUDIO_FILE || '/tmp/soniox-test.wav'))
 console.log(`PCM: ${pcm.length} bytes (${(pcm.length / 2 / 16000).toFixed(1)}s @ 16kHz mono s16le)`)
 console.log(`Connecting to Soniox (model ${MODEL}${TRANSLATE_TO ? `, translate→${TRANSLATE_TO}` : ''})…`)
 
