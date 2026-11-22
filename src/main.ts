@@ -8,13 +8,15 @@ import {
 } from '@evenrealities/even_hub_sdk'
 import { getTextWidth } from '@evenrealities/pretext'
 import { startSttStream, type SttClient } from './asr/stt'
-import { mountUi, setStatus, setTranscript, setTranslation, setTargetLangLabel, formatSpeaker } from './ui'
+import { mountUi, setStatus, setTranscript, setTranslation, setPaired, setTargetLangLabel, formatSpeaker } from './ui'
 import type { SttSnapshot } from './asr/stt'
 
 // Glasses placeholders (the G2 font has kana/kanji but not symbols like ⚙).
 const PH_LISTEN = '聞き取り中…'
 const PH_TRANSLATE = '翻訳を待っています…'
-import { type AppSettings, SETTINGS_KEY, mergeSettings } from './settings'
+import { type AppSettings, type DisplayMode, DISPLAY_MODES, SETTINGS_KEY, mergeSettings, hasOriginalPane } from './settings'
+import { type Pair, PAIR_LINE, withInterim, pairedGlassesText } from './paired'
+import { History, type SessionRecord } from './history'
 
 const bridge = await waitForEvenAppBridge()
 
@@ -52,18 +54,72 @@ async function loadSettings(): Promise<AppSettings> {
     const devKey = (import.meta.env.VITE_STT_API_KEY as string) || ''
     if (devKey) s.apiKey = devKey
   }
-  // Dev-only URL overrides (used by sim/run.sh): `?target=ja&speakers=1`.
+  // Dev-only URL overrides (used by sim/run.sh): `?target=ja&speakers=1&mode=paired`.
   if (import.meta.env.DEV) {
     const q = new URLSearchParams(location.search)
     const t = q.get('target')
     if (t !== null) s.targetLang = t
     if (q.get('speakers') !== null) s.speakerLabels = q.get('speakers') === '1'
+    const m = q.get('mode') as DisplayMode | null
+    if (m && DISPLAY_MODES.includes(m)) s.displayMode = m
   }
   return s
 }
 
 let settings = await loadSettings()
-mountUi({ settings, onSave: handleSave })
+
+// ── History (Bilingual Paired sessions, saved on the phone via the SDK) ──────
+const history = new History({
+  get: key => serial('history.get', () => bridge.getLocalStorage(key)),
+  set: (key, value) => serial('history.set', () => bridge.setLocalStorage(key, value)),
+})
+let session: SessionRecord | null = null
+let sessionDirty = false
+let autosaveTimer: number | null = null
+const AUTOSAVE_MS = 5000
+
+function startSession() {
+  session = { id: Date.now(), start: Date.now(), end: Date.now(), targetLang: settings.targetLang, count: 0, preview: '', pairs: [] }
+  sessionDirty = false
+}
+function updateSession(pairs: Pair[]) {
+  if (!session) return
+  session.pairs = pairs
+  session.end = Date.now()
+  sessionDirty = true
+  if (autosaveTimer === null) autosaveTimer = window.setTimeout(() => void flushSession(), AUTOSAVE_MS)
+}
+/** Save the current session now (no-op when nothing changed or it is empty). */
+async function flushSession() {
+  if (autosaveTimer !== null) {
+    clearTimeout(autosaveTimer)
+    autosaveTimer = null
+  }
+  if (!session || !sessionDirty) return
+  sessionDirty = false
+  const snapshot: SessionRecord = { ...session, pairs: session.pairs.map(p => ({ ...p })) }
+  try {
+    await history.save(snapshot)
+  } catch (err) {
+    sessionDirty = true
+    console.warn('[history] save failed:', (err as Error)?.message ?? err)
+  }
+}
+
+mountUi({
+  settings,
+  onSave: handleSave,
+  history: {
+    list: async () => {
+      await flushSession()
+      return history.list()
+    },
+    get: id => history.get(id),
+    remove: id => history.remove(id),
+    removeAll: () => history.removeAll(),
+    currentId: () => session?.id ?? null,
+  },
+})
 
 // ── Render state ─────────────────────────────────────────────────────────────
 let curTranscript = '起動中…'
@@ -72,13 +128,14 @@ let lastTranscript = ''
 let lastTranslation = ''
 let rawTx = ''
 let rawTl = ''
+let rawPaired = ''
 
 // ── Layout / geometry (borderless; width-aware; split or full-screen) ────────
 const PAD = 3
 const LINE_H = 27
 const spaceW = Math.max(1, getTextWidth('a a') - getTextWidth('aa'))
 
-let hasTranscript = settings.showTranscript
+let hasTranscript = hasOriginalPane(settings.displayMode)
 let transcriptLines = 0
 let translationLines = 0
 let paneW = 576
@@ -94,12 +151,13 @@ function mkPane(id: number, name: string, y: number, h: number, capture: boolean
 }
 
 function buildLayout() {
-  hasTranscript = settings.showTranscript
+  hasTranscript = hasOriginalPane(settings.displayMode)
   paneW = Math.round((576 * (settings.widthPct || 100)) / 100)
   paneX = Math.round((576 - paneW) / 2)
   innerW = paneW - 2 * PAD
   if (hasTranscript) {
-    const TOP_H = 62
+    // split: 2 lines of original; split37: 3 lines original : 7 lines translation.
+    const TOP_H = settings.displayMode === 'split37' ? 3 * LINE_H + 2 * PAD : 62
     const BOT_H = 288 - TOP_H
     transcriptLines = Math.floor((TOP_H - 2 * PAD) / LINE_H)
     translationLines = Math.floor((BOT_H - 2 * PAD) / LINE_H)
@@ -177,20 +235,23 @@ function centerLine(line: string): string {
 // `visibleLines` = how many content lines to show (most recent).
 // `paneLines`    = physical rows in the pane; for bottom anchoring we pad the
 //                  top so the newest line sits at the pane's bottom row.
-function fitTail(text: string, placeholder: string, visibleLines: number, paneLines: number): string {
+// Paragraphs are separated by '\n' (line spacing applies between them); a
+// PAIR_LINE inside a paragraph breaks the line without adding a gap (used to
+// keep an original and its translation together in Bilingual Paired mode).
+function fitTail(text: string, placeholder: string, visibleLines: number, paneLines: number, split = settings.splitSentences): string {
   let t = text.trim()
   let lines: string[]
   if (!t) {
     lines = [placeholder]
   } else {
-    if (settings.splitSentences) t = splitSentences(t)
+    if (split) t = splitSentences(t)
     const tail = t.length > 1400 ? t.slice(-1400) : t
     const gap = settings.lineGap || 0
     const out: string[] = []
     const paras = tail.split('\n')
     for (let i = 0; i < paras.length; i++) {
       if (i > 0) for (let g = 0; g < gap; g++) out.push('')
-      let wl = wrapToLines(paras[i], innerW)
+      let wl = paras[i].split(PAIR_LINE).flatMap(sub => wrapToLines(sub, innerW))
       if (settings.align === 'center') wl = wl.map(centerLine)
       out.push(...wl)
     }
@@ -209,6 +270,10 @@ function fitTail(text: string, placeholder: string, visibleLines: number, paneLi
 function recomputeDisplay() {
   if (hasTranscript) curTranscript = fitTail(rawTx, PH_LISTEN, transcriptLines, transcriptLines)
   const visible = settings.maxLines > 0 ? Math.min(translationLines, settings.maxLines) : translationLines
+  if (settings.displayMode === 'paired') {
+    curTranslation = fitTail(rawPaired, PH_LISTEN, visible, translationLines, false)
+    return
+  }
   const primary = settings.targetLang ? rawTl : rawTx
   curTranslation = fitTail(primary, settings.targetLang ? PH_TRANSLATE : PH_LISTEN, visible, translationLines)
 }
@@ -269,10 +334,14 @@ function onSnapshot(s: SttSnapshot) {
   // Glasses: unlabeled text. Phone: speaker-labeled text.
   rawTx = s.transcriptFinal + s.transcriptInterim
   rawTl = s.translationFinal + s.translationInterim
+  const paired = withInterim(s.pairs, s.transcriptInterim, s.foreignTranslationInterim, s.sameInterim)
+  rawPaired = pairedGlassesText(paired)
   recomputeDisplay()
   setTranscript(s.transcriptLabeled, s.transcriptInterim)
   setTranslation(s.translationLabeled, s.translationInterim)
+  setPaired(paired)
   scheduleGlassesRender()
+  updateSession(s.pairs)
 }
 
 function onSttError(err: unknown) {
@@ -283,6 +352,8 @@ function onSttError(err: unknown) {
 function applySettings() {
   stt?.close()
   stt = null
+  void flushSession() // the previous stream's conversation goes to history
+  session = null
   setTargetLangLabel(settings.targetLang)
 
   if (!settings.apiKey) {
@@ -298,7 +369,13 @@ function applySettings() {
   }
 
   try {
-    stt = startSttStream(
+    // Ignore late snapshots from a stream we already closed (it may still
+    // deliver its final "finished" message) so they don't leak into the new session.
+    let client: SttClient | null = null
+    const onSnap = (s: SttSnapshot) => {
+      if (client && stt === client) onSnapshot(s)
+    }
+    stt = client = startSttStream(
       {
         apiKey: settings.apiKey,
         targetLang: settings.targetLang,
@@ -307,7 +384,7 @@ function applySettings() {
         noTranslateLangs: settings.noTranslateLangs,
         formatSpeaker,
       },
-      onSnapshot,
+      onSnap,
       onSttError,
       status => {
         if (status === 'live') setStatus('listening', 'マイク入力中・テンプルをダブルタップで終了')
@@ -319,6 +396,7 @@ function applySettings() {
     onSttError(err)
     return
   }
+  startSession()
 
   if (!micOn) {
     serial('audioOn', () => bridge.audioControl(true))
@@ -333,7 +411,7 @@ async function handleSave(next: AppSettings) {
     console.error('Failed to persist settings:', err),
   )
 
-  const needRebuild = next.showTranscript !== prev.showTranscript || next.widthPct !== prev.widthPct
+  const needRebuild = next.displayMode !== prev.displayMode || next.widthPct !== prev.widthPct
   const needRestart =
     next.apiKey !== prev.apiKey ||
     next.targetLang !== prev.targetLang ||
@@ -344,6 +422,7 @@ async function handleSave(next: AppSettings) {
   if (needRestart) {
     rawTx = ''
     rawTl = ''
+    rawPaired = ''
     curTranscript = PH_LISTEN
     curTranslation = next.targetLang ? PH_TRANSLATE : PH_LISTEN
     if (needRebuild) await applyLayout()
@@ -363,6 +442,7 @@ let cleanedUp = false
 function cleanup() {
   if (cleanedUp) return
   cleanedUp = true
+  void flushSession()
   serial('audioOff', () => bridge.audioControl(false))
   stt?.close()
   unsubscribe()
@@ -376,12 +456,14 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
   const textType = event.textEvent?.eventType ?? null
 
   if (sysType === OsEventTypeList.DOUBLE_CLICK_EVENT || textType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
-    serial('exit', () => bridge.shutDownPageContainer(1))
+    // Save the conversation first, then show the system exit dialog.
+    void flushSession().finally(() => serial('exit', () => bridge.shutDownPageContainer(1)))
     return
   }
 
   // Lifecycle — survive the 5-minute locked-phone test cleanly.
   if (sysType === OsEventTypeList.FOREGROUND_EXIT_EVENT) {
+    void flushSession()
     if (micOn) {
       serial('audioOff', () => bridge.audioControl(false))
       micOn = false

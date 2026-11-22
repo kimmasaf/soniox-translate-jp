@@ -14,7 +14,7 @@
 //
 // Env:
 //   SONIOX_API_KEY     key (else read from .env.local's VITE_STT_API_KEY)
-//   SONIOX_MODEL       default stt-rt-v4
+//   SONIOX_MODEL       default stt-rt-v6
 //   SONIOX_TRANSLATE_TO  e.g. "en" → enable one-way translation
 //   SONIOX_LANGUAGES   comma-separated source hints (default: en, or none in translate mode)
 //   SAY_VOICE          macOS voice, e.g. "Mónica" (es), "Thomas" (fr), "Anna" (de)
@@ -22,7 +22,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 
 const TEXT = process.argv[2] || 'Testing, one two three. The quick brown fox jumps over the lazy dog.'
-const MODEL = process.env.SONIOX_MODEL || 'stt-rt-v4'
+const MODEL = process.env.SONIOX_MODEL || 'stt-rt-v6'
 const TRANSLATE_TO = (process.env.SONIOX_TRANSLATE_TO || '').trim()
 const VOICE = (process.env.SAY_VOICE || '').trim()
 const LANG_HINTS = (process.env.SONIOX_LANGUAGES ?? (TRANSLATE_TO ? '' : 'en'))

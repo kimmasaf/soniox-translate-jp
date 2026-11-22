@@ -18,8 +18,11 @@
 // Docs: https://soniox.com/docs/stt/rt/real-time-transcription
 //       https://soniox.com/docs/stt/rt/real-time-translation
 
+import type { Pair } from '../paired'
+
 const SONIOX_WS_URL = 'wss://stt-rt.soniox.com/transcribe-websocket'
-const DEFAULT_MODEL = 'stt-rt-v4'
+// Latest real-time model (Nov 2026). See https://docs.soniox.com/stt/models
+const DEFAULT_MODEL = 'stt-rt-v6'
 const SPEAKER_ICONS = ['●', '■', '★', '▲', '♦', '♥', '♣', '♠']
 const MAX_PENDING_CHUNKS = 50 // ~5s of audio buffered while (re)connecting
 const BACKPRESSURE_BYTES = 256_000 // ~8s of audio; drop frames past this
@@ -54,6 +57,12 @@ export interface SttSnapshot {
   /** Same text with a speaker label at each speaker change (phone UI). */
   transcriptLabeled: string
   translationLabeled: string
+  /** Final utterances as original/translation pairs (Bilingual Paired view + history). */
+  pairs: Pair[]
+  /** Interim same-language text (also included in translationInterim). */
+  sameInterim: string
+  /** Interim translation of foreign speech only (translationInterim minus sameInterim). */
+  foreignTranslationInterim: string
   finished: boolean
 }
 
@@ -119,6 +128,46 @@ export function startSttStream(
   let lastSpkTx: string | null = null
   let lastSpkTl: string | null = null
   const spkOrder = new Map<string, number>()
+
+  // Bilingual pairs. Soniox does not tag which translation belongs to which
+  // original, so: an original starts a new pair once the current pair already
+  // has translation (or the speaker changed); a translation attaches to the
+  // latest foreign-language pair. If speech resumes before a translation
+  // arrives, two utterances merge into one pair — never misaligned.
+  const pairs: Pair[] = []
+  const MAX_PAIRS = 3000
+  function spkIndex(spk?: string): number | undefined {
+    if (!speakerLabels || !spk) return undefined
+    if (!spkOrder.has(spk)) spkOrder.set(spk, spkOrder.size)
+    return spkOrder.get(spk)
+  }
+  function pairOrig(text: string, spk?: string) {
+    const s = spkIndex(spk)
+    const last = pairs[pairs.length - 1]
+    if (!last || last.same || last.trans || (s !== undefined && last.orig && last.speaker !== s)) {
+      pairs.push({ speaker: s, orig: text.trimStart(), trans: '', same: false })
+    } else {
+      last.orig += text
+    }
+  }
+  function pairTrans(text: string) {
+    for (let i = pairs.length - 1; i >= 0; i--) {
+      if (!pairs[i].same) {
+        pairs[i].trans += pairs[i].trans ? text : text.trimStart()
+        return
+      }
+    }
+    pairs.push({ orig: '', trans: text.trimStart(), same: false })
+  }
+  function pairSame(text: string, spk?: string) {
+    const s = spkIndex(spk)
+    const last = pairs[pairs.length - 1]
+    if (!last || !last.same || (s !== undefined && last.speaker !== s)) {
+      pairs.push({ speaker: s, orig: '', trans: text.trimStart(), same: true })
+    } else {
+      last.trans += text
+    }
+  }
 
   let ws: WebSocket | null = null
   let configSent = false
@@ -189,6 +238,8 @@ export function startSttStream(
 
     let transcriptInterim = ''
     let translationInterim = ''
+    let sameInterim = ''
+    let foreignTranslationInterim = ''
     for (const t of res.tokens ?? []) {
       const text = t.text
       if (!text) continue
@@ -202,19 +253,35 @@ export function startSttStream(
       }
       if (isTranslation) {
         if (noTranslate.includes(t.source_language ?? '')) continue
-        if (t.is_final) appendTranslation(text, t.speaker)
-        else translationInterim += text
+        if (t.is_final) {
+          appendTranslation(text, t.speaker)
+          pairTrans(text)
+        } else {
+          translationInterim += text
+          foreignTranslationInterim += text
+        }
       } else {
         // Speech already in the target language (or a keep-as-is language)
         // needs no translation: show it ONCE, in the translation stream only,
         // instead of duplicating it in the original-language stream.
         const keepAsIs = targetLang && (t.language === targetLang || noTranslate.includes(t.language ?? ''))
         if (keepAsIs) {
-          if (t.is_final) appendTranslation(text, t.speaker)
-          else translationInterim += text
+          if (t.is_final) {
+            appendTranslation(text, t.speaker)
+            pairSame(text, t.speaker)
+          } else {
+            translationInterim += text
+            sameInterim += text
+          }
         } else {
-          if (t.is_final) appendTranscript(text, t.speaker)
-          else transcriptInterim += text
+          if (t.is_final) {
+            appendTranscript(text, t.speaker)
+            // Transcript-only mode: record as single-line entries for history.
+            if (targetLang) pairOrig(text, t.speaker)
+            else pairSame(text, t.speaker)
+          } else {
+            transcriptInterim += text
+          }
         }
       }
     }
@@ -225,10 +292,14 @@ export function startSttStream(
     transcriptLabeled = cap(transcriptLabeled)
     translationLabeled = cap(translationLabeled)
 
+    if (pairs.length > MAX_PAIRS) pairs.splice(0, pairs.length - MAX_PAIRS)
+
     if (res.finished) console.info('[soniox] stream finished')
     onSnapshot({
       transcriptFinal, transcriptInterim, translationFinal, translationInterim,
-      transcriptLabeled, translationLabeled, finished: !!res.finished,
+      transcriptLabeled, translationLabeled,
+      pairs, sameInterim, foreignTranslationInterim,
+      finished: !!res.finished,
     })
   }
 

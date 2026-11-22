@@ -37,7 +37,7 @@ cd /app
 npx vite --host 127.0.0.1 --port 5173 --strictPort >"$OUT/vite.log" 2>&1 & VITE_PID=$!
 for _ in $(seq 1 40); do curl -sf http://127.0.0.1:5173 >/dev/null && break; sleep 0.25; done
 
-QS="${TARGET:+target=$TARGET&}${SPEAKERS:+speakers=$SPEAKERS&}"
+QS="${TARGET:+target=$TARGET&}${SPEAKERS:+speakers=$SPEAKERS&}${MODE:+mode=$MODE&}"
 RUST_LOG=${RUST_LOG:-info} "$SIM" "http://127.0.0.1:5173/${QS:+?${QS%&}}" --automation-port 9898 --no-aid \
   >"$OUT/simulator.log" 2>&1 & SIM_PID=$!
 for _ in $(seq 1 60); do curl -sf $API/api/ping >/dev/null && break; sleep 0.25; done
@@ -81,6 +81,16 @@ for a in $INPUTS; do
   sleep 1.5
   curl -sf $API/api/screenshot/glasses -o "$OUT/glasses-$i-$a.png"
   i=$((i+1))
+done
+
+# POST_CLICKS: like CLICKS, but after the audio has been fed (e.g. open 履歴).
+c=0
+for xy in ${POST_CLICKS:-}; do
+  c=$((c+1))
+  if [ "$xy" = scroll ]; then xdotool mousemove 500 600 click --repeat 15 --delay 50 5
+  else xdotool mousemove ${xy%,*} ${xy#*,} click 1; fi
+  sleep 2
+  import -window root "$OUT/desktop-p$c.png" 2>/dev/null || true
 done
 
 curl -sf "$API/api/console" -o "$OUT/console.json"

@@ -4,7 +4,16 @@
 // Font scale: --base in injectStyles() sizes everything; --main-scale and
 // --settings-scale shrink/grow the caption and settings screens relative to it.
 import { LANGUAGES, langName } from './languages'
-import type { AppSettings } from './settings'
+import { type AppSettings, type DisplayMode, DISPLAY_MODES, hasOriginalPane } from './settings'
+import type { PairView } from './paired'
+import { type SessionMeta, type SessionRecord, exportText, exportFileName, fmtDateTime, fmtTime } from './history'
+
+const MODE_LABEL: Record<DisplayMode, string> = {
+  split: '上下分割(原文 2 行)',
+  split37: '上下分割(原文 3:翻訳 7)',
+  paired: '対訳(Bilingual Paired)',
+  translation: '翻訳のみ(全画面)',
+}
 
 type Status = 'connecting' | 'listening' | 'error' | 'setup' | 'reconnecting'
 
@@ -28,11 +37,25 @@ let txBodyEl: HTMLElement
 let tlBodyEl: HTMLElement
 let tlLabelEl: HTMLElement
 let secondaryEl: HTMLElement
+let primaryEl: HTMLElement
+let pairedEl: HTMLElement
+let pairedBodyEl: HTMLElement
 let tlFull = ''
+let pairedFull: PairView[] = []
+
+export interface HistoryHandlers {
+  list(): Promise<SessionMeta[]>
+  get(id: number): Promise<SessionRecord | null>
+  remove(id: number): Promise<void>
+  removeAll(): Promise<void>
+  /** Id of the session being recorded right now (shown as 記録中). */
+  currentId(): number | null
+}
 
 export interface UiHandlers {
   settings: AppSettings
   onSave: (next: AppSettings) => void
+  history: HistoryHandlers
 }
 
 const opt = (v: string | number, label: string, sel: string | number) =>
@@ -48,7 +71,7 @@ function switchRow(id: string, label: string, checked: boolean, sub = '') {
   }</span><input id="${id}" type="checkbox" class="switch"${checked ? ' checked' : ''}/></label>`
 }
 
-export function mountUi({ settings, onSave }: UiHandlers) {
+export function mountUi({ settings, onSave, history }: UiHandlers) {
   const app = document.querySelector<HTMLDivElement>('#app')!
   const langOptions = LANGUAGES.map(l => opt(l.code, l.name, settings.targetLang)).join('')
 
@@ -56,11 +79,21 @@ export function mountUi({ settings, onSave }: UiHandlers) {
     <div id="view-main" class="view">
       <header class="bar">
         <h1>Soniox 翻訳</h1>
-        <button id="openSettings" type="button" class="bar-btn" aria-label="設定">⚙︎ 設定</button>
+        <span class="bar-actions">
+          <button id="openHistory" type="button" class="bar-btn">履歴</button>
+          <button id="openSettings" type="button" class="bar-btn" aria-label="設定">⚙︎ 設定</button>
+        </span>
       </header>
       <div id="status" class="status status-connecting"><span class="dot"></span><span id="status-text">接続中</span></div>
 
-      <section class="card card-primary" aria-live="polite">
+      <section id="pane-paired" class="card card-primary" aria-live="polite" hidden>
+        <div class="card-head">
+          <span class="card-title">対訳</span>
+          <button id="copyPaired" type="button" class="text-btn">コピー</button>
+        </div>
+        <div id="paired-body" class="card-body paired"></div>
+      </section>
+      <section id="pane-primary" class="card card-primary" aria-live="polite">
         <div class="card-head">
           <span id="tl-label" class="card-title"></span>
           <button id="copyTl" type="button" class="text-btn">コピー</button>
@@ -108,7 +141,7 @@ export function mountUi({ settings, onSave }: UiHandlers) {
 
       <h2 class="section-title">メガネの表示</h2>
       <div class="group">
-        ${switchRow('showtx', '原文を表示', settings.showTranscript, 'オフにすると翻訳を全画面で表示')}
+        ${selectRow('mode', '表示モード', DISPLAY_MODES.map(m => opt(m, MODE_LABEL[m], settings.displayMode)).join(''))}
         ${switchRow('split', '文ごとに改行', settings.splitSentences)}
         ${selectRow('align', '文字の配置', opt('left', '左寄せ', settings.align) + opt('center', '中央', settings.align))}
         ${selectRow('valign', '表示の基準', opt('bottom', '下から', settings.vAlign) + opt('top', '上から', settings.vAlign))}
@@ -122,8 +155,21 @@ export function mountUi({ settings, onSave }: UiHandlers) {
         ${switchRow('speakers', '話者を識別', settings.speakerLabels, '「話者1」などのラベルはスマートフォンにだけ表示し、メガネには表示しません')}
       </div>
 
+      <p class="section-foot">表示モードはスマートフォンの画面にも反映されます。対訳は、原文の次の行に「→」付きで翻訳を表示します。</p>
+
       <button id="save" type="button" class="primary">保存</button>
       <p id="saved" class="saved" role="status"></p>
+    </div>
+
+    <div id="view-history" class="view" hidden>
+      <header class="bar">
+        <button id="closeHistory" type="button" class="bar-btn">‹ 戻る</button>
+        <h1>履歴</h1>
+        <span class="bar-spacer"></span>
+      </header>
+      <p class="section-foot">会話は対訳の形でこのスマートフォンのアプリ内に自動保存されます(最新 50 件)。「書き出す」でテキストファイルとして保存・共有できます。</p>
+      <div id="history-list" class="history-list"></div>
+      <button id="deleteAll" type="button" class="danger" hidden>すべて削除</button>
     </div>
   `
 
@@ -134,16 +180,45 @@ export function mountUi({ settings, onSave }: UiHandlers) {
   tlBodyEl = $('#tl-body')
   tlLabelEl = $('#tl-label')
   secondaryEl = $('#pane-secondary')
+  primaryEl = $('#pane-primary')
+  pairedEl = $('#pane-paired')
+  pairedBodyEl = $('#paired-body')
 
-  const mainView = $('#view-main')
-  const settingsView = $('#view-settings')
-  const showSettings = (on: boolean) => {
-    mainView.hidden = on
-    settingsView.hidden = !on
+  const views = { main: $('#view-main'), settings: $('#view-settings'), history: $('#view-history') }
+  const show = (name: keyof typeof views) => {
+    for (const [k, el] of Object.entries(views)) el.hidden = k !== name
     window.scrollTo(0, 0)
   }
+  const showSettings = (on: boolean) => show(on ? 'settings' : 'main')
   $('#openSettings').addEventListener('click', () => showSettings(true))
   $('#closeSettings').addEventListener('click', () => showSettings(false))
+  $('#openHistory').addEventListener('click', () => {
+    show('history')
+    void renderHistory(history, $('#history-list'), $<HTMLButtonElement>('#deleteAll'))
+  })
+  $('#closeHistory').addEventListener('click', () => show('main'))
+  const deleteAllEl = $<HTMLButtonElement>('#deleteAll')
+  deleteAllEl.addEventListener('click', () =>
+    confirmTap(deleteAllEl, 'もう一度押すとすべて削除', async () => {
+      await history.removeAll()
+      void renderHistory(history, $('#history-list'), deleteAllEl)
+    }),
+  )
+
+  const copyPairedEl = $<HTMLButtonElement>('#copyPaired')
+  copyPairedEl.addEventListener('click', () =>
+    copyToClipboard(
+      pairedFull
+        .map(p => {
+          const o = (p.orig + p.origInterim).trim()
+          const t = (p.trans + p.transInterim).trim()
+          return p.same || !o ? t : t ? `${o}\n→ ${t}` : o
+        })
+        .filter(Boolean)
+        .join('\n\n'),
+      copyPairedEl,
+    ),
+  )
 
   const apiKeyEl = $<HTMLInputElement>('#apiKey')
   const revealEl = $<HTMLButtonElement>('#revealKey')
@@ -163,7 +238,7 @@ export function mountUi({ settings, onSave }: UiHandlers) {
     const next: AppSettings = {
       apiKey: apiKeyEl.value.trim(),
       targetLang: val('lang'),
-      showTranscript: on('showtx'),
+      displayMode: (DISPLAY_MODES as string[]).includes(val('mode')) ? (val('mode') as DisplayMode) : 'split',
       noTranslateLangs: parseCodes(val('notranslate')),
       splitSentences: on('split'),
       speakerLabels: on('speakers'),
@@ -174,7 +249,7 @@ export function mountUi({ settings, onSave }: UiHandlers) {
       maxLines: parseInt(val('maxlines'), 10) || 0,
     }
     setTargetLangLabel(next.targetLang)
-    setSecondaryVisible(next.showTranscript)
+    applyMode(next.displayMode)
     savedEl.textContent = next.apiKey ? '保存しました' : '保存しました(API キーが未入力です)'
     setTimeout(() => (savedEl.textContent = ''), 2500)
     onSave(next)
@@ -182,7 +257,7 @@ export function mountUi({ settings, onSave }: UiHandlers) {
   })
 
   setTargetLangLabel(settings.targetLang)
-  setSecondaryVisible(settings.showTranscript)
+  applyMode(settings.displayMode)
   showSettings(!settings.apiKey)
   injectStyles()
 }
@@ -208,8 +283,179 @@ export function setTargetLangLabel(code: string) {
   tlLabelEl.textContent = code ? `翻訳(${langName(code)})` : '文字起こし'
 }
 
-function setSecondaryVisible(visible: boolean) {
-  if (secondaryEl) secondaryEl.hidden = !visible
+// Phone layout follows the glasses display mode.
+function applyMode(mode: DisplayMode) {
+  if (!secondaryEl) return
+  const paired = mode === 'paired'
+  pairedEl.hidden = !paired
+  primaryEl.hidden = paired
+  secondaryEl.hidden = paired || !hasOriginalPane(mode)
+  secondaryEl.classList.toggle('card-37', mode === 'split37')
+  if (paired) setPaired(pairedFull)
+}
+
+/** Bilingual Paired phone view: original (dim) then translation, per utterance. */
+export function setPaired(vm: PairView[]) {
+  pairedFull = vm
+  if (!pairedBodyEl || pairedEl.hidden) return
+  const el = pairedBodyEl
+  const stick = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  const frag = document.createDocumentFragment()
+  for (const p of vm.slice(-200)) {
+    const orig = p.orig + p.origInterim
+    const trans = p.trans + p.transInterim
+    if (!orig.trim() && !trans.trim()) continue
+    const item = document.createElement('div')
+    item.className = 'pair'
+    if (p.speaker !== undefined) {
+      const chip = document.createElement('span')
+      chip.className = 'speaker'
+      chip.textContent = formatSpeaker(p.speaker).replace(/[:\s]+$/, '')
+      item.append(chip)
+    }
+    if (!p.same && orig.trim()) {
+      const o = document.createElement('div')
+      o.className = 'pair-orig'
+      o.append(p.orig)
+      if (p.origInterim) o.append(interimSpan(p.origInterim))
+      item.append(o)
+    }
+    if (trans.trim()) {
+      const t = document.createElement('div')
+      t.className = p.same ? 'pair-trans pair-same' : 'pair-trans'
+      t.append(p.trans)
+      if (p.transInterim) t.append(interimSpan(p.transInterim))
+      item.append(t)
+    }
+    frag.append(item)
+  }
+  el.replaceChildren(frag)
+  if (stick) el.scrollTop = el.scrollHeight
+}
+
+function interimSpan(text: string) {
+  const s = document.createElement('span')
+  s.className = 'interim'
+  s.textContent = text
+  return s
+}
+
+// ── History screen ───────────────────────────────────────────────────────────
+async function renderHistory(h: HistoryHandlers, listEl: HTMLElement, deleteAllEl: HTMLButtonElement) {
+  listEl.textContent = '読み込み中…'
+  const items = await h.list()
+  deleteAllEl.hidden = items.length === 0
+  if (!items.length) {
+    listEl.innerHTML = '<p class="empty">まだ保存された会話はありません。</p>'
+    return
+  }
+  const cur = h.currentId()
+  const frag = document.createDocumentFragment()
+  for (const m of items) {
+    const row = document.createElement('div')
+    row.className = 'group history-item'
+    const head = document.createElement('div')
+    head.className = 'history-head'
+    head.textContent = `${fmtDateTime(m.start)}〜${fmtTime(m.end)}・${m.targetLang ? langName(m.targetLang) : '文字起こし'}・${m.count} 件`
+    if (m.id === cur) {
+      const live = document.createElement('span')
+      live.className = 'live-tag'
+      live.textContent = '記録中'
+      head.append(live)
+    }
+    const pv = document.createElement('div')
+    pv.className = 'history-preview'
+    pv.textContent = m.preview
+    const actions = document.createElement('div')
+    actions.className = 'history-actions'
+    const exportBtn = button('書き出す', async () => {
+      const rec = await h.get(m.id)
+      if (rec) await exportFile(exportFileName(rec), exportText(rec, formatSpeaker), exportBtn)
+    })
+    const copyBtn = button('コピー', async () => {
+      const rec = await h.get(m.id)
+      if (rec) await copyToClipboard(exportText(rec, formatSpeaker), copyBtn)
+    })
+    actions.append(exportBtn, copyBtn)
+    if (m.id !== cur) {
+      const delBtn: HTMLButtonElement = button(
+        '削除',
+        () =>
+          confirmTap(delBtn, 'もう一度押すと削除', async () => {
+            await h.remove(m.id)
+            row.remove()
+          }),
+        'text-btn danger-text',
+      )
+      actions.append(delBtn)
+    }
+    row.append(head, pv, actions)
+    frag.append(row)
+  }
+  listEl.replaceChildren(frag)
+}
+
+// Two-tap confirmation (window.confirm may be unavailable in the host WebView).
+const armed = new WeakMap<HTMLButtonElement, { label: string; timer: number }>()
+async function confirmTap(btn: HTMLButtonElement, prompt: string, action: () => Promise<void>) {
+  const a = armed.get(btn)
+  if (a) {
+    clearTimeout(a.timer)
+    armed.delete(btn)
+    btn.textContent = a.label
+    await action()
+    return
+  }
+  const label = btn.textContent ?? ''
+  btn.textContent = prompt
+  armed.set(btn, {
+    label,
+    timer: window.setTimeout(() => {
+      armed.delete(btn)
+      btn.textContent = label
+    }, 3000),
+  })
+}
+
+function button(label: string, onClick: () => void | Promise<void>, cls = 'text-btn') {
+  const b = document.createElement('button')
+  b.type = 'button'
+  b.className = cls
+  b.textContent = label
+  b.addEventListener('click', () => void onClick())
+  return b
+}
+
+// Save a text file to the phone: the OS share sheet when available (lets the
+// user pick Files / AirDrop / mail …), otherwise a regular download.
+async function exportFile(name: string, text: string, btn: HTMLButtonElement) {
+  const flash = (msg: string) => {
+    const prev = btn.textContent
+    btn.textContent = msg
+    setTimeout(() => (btn.textContent = prev), 1800)
+  }
+  const file = new File([text], name, { type: 'text/plain;charset=utf-8' })
+  try {
+    if (navigator.canShare?.({ files: [file] })) {
+      await navigator.share({ files: [file], title: name })
+      return flash('書き出しました')
+    }
+  } catch (err) {
+    if ((err as DOMException)?.name === 'AbortError') return // user cancelled the sheet
+  }
+  try {
+    const url = URL.createObjectURL(file)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    document.body.append(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 10_000)
+    flash('ダウンロードしました')
+  } catch {
+    flash('書き出せません。コピーを使ってください')
+  }
 }
 
 // Render text into a pane: "話者N: " line prefixes become label chips, the
@@ -379,6 +625,31 @@ function injectStyles() {
       background: var(--accent); color: #fff; font: inherit; font-size: 1em; font-weight: 600; cursor: pointer; }
     .primary:active { opacity: 0.8; }
     .saved { min-height: 1.4em; font-size: 0.9em; color: var(--ok); text-align: center; margin: 0.3em 0 0; }
+
+    .bar-actions { display: flex; gap: 0.9em; }
+    /* split37: original pane 3 : translation 7 */
+    .card-secondary.card-37 { flex: 1.07; }
+
+    /* Bilingual Paired */
+    .card-body.paired { white-space: normal; display: flex; flex-direction: column; gap: 0.7em; }
+    .pair-orig { color: var(--sub); font-size: 0.85em; white-space: pre-wrap; }
+    .pair-trans { white-space: pre-wrap; }
+    .pair-trans:not(.pair-same)::before { content: '→ '; color: var(--sub); }
+    .pair > .speaker { margin-bottom: 0.15em; }
+
+    /* History */
+    .history-list { display: flex; flex-direction: column; gap: 0.6em; margin-top: 0.4em; }
+    .history-item { padding: 0.6em 0.75em; display: flex; flex-direction: column; gap: 0.25em; }
+    .history-head { font-size: 0.85em; color: var(--sub); display: flex; align-items: center; gap: 0.5em; flex-wrap: wrap; }
+    .history-preview { font-size: 1em; }
+    .history-actions { display: flex; gap: 1em; margin-top: 0.2em; }
+    .history-actions .text-btn { padding-left: 0; }
+    .live-tag { font-size: 0.8em; color: #fff; background: var(--ok); border-radius: 0.4em; padding: 0 0.4em; }
+    .danger-text { color: var(--err) !important; }
+    .danger { margin-top: 1em; width: 100%; min-height: 2.3em; border: 0; border-radius: 0.6em;
+      background: var(--card); color: var(--err); font: inherit; font-size: 1em; cursor: pointer; }
+    .empty { color: var(--sub); text-align: center; margin: 2em 0; }
+    #view-history { font-size: var(--settings-scale); }
   `
   const style = document.createElement('style')
   style.textContent = css

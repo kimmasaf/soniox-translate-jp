@@ -2,13 +2,23 @@
 // restarts; stored per-user in the Even companion app). Each user supplies
 // their OWN Soniox API key so they're billed for their own usage.
 
+/**
+ * Glasses (and phone) layout:
+ *  - split:       original strip on top (2 lines) + translation below
+ *  - split37:     original 3 : translation 7 (3 lines + 7 lines)
+ *  - paired:      Bilingual Paired — each original followed by its translation
+ *  - translation: translation only, full screen
+ */
+export type DisplayMode = 'split' | 'split37' | 'paired' | 'translation'
+export const DISPLAY_MODES: DisplayMode[] = ['split', 'split37', 'paired', 'translation']
+
 export interface AppSettings {
   /** User's Soniox API key. Empty until they set it in the phone UI. */
   apiKey: string
   /** Translation target language code ('' = transcript only). */
   targetLang: string
-  /** Show the original-language transcript strip (off = translation full-screen). */
-  showTranscript: boolean
+  /** Screen layout (see DisplayMode). */
+  displayMode: DisplayMode
   /** Language codes to keep as-is / NOT translate (the target is always kept). */
   noTranslateLangs: string[]
   /** Newline per sentence (at . ? ! + Soniox pauses). */
@@ -30,7 +40,7 @@ export interface AppSettings {
 export const DEFAULT_SETTINGS: AppSettings = {
   apiKey: '',
   targetLang: 'ja',
-  showTranscript: true,
+  displayMode: 'split',
   noTranslateLangs: [],
   splitSentences: true,
   speakerLabels: false,
@@ -41,14 +51,24 @@ export const DEFAULT_SETTINGS: AppSettings = {
   maxLines: 0,
 }
 
+/** Whether the layout has a separate original-language pane. */
+export function hasOriginalPane(mode: DisplayMode): boolean {
+  return mode === 'split' || mode === 'split37'
+}
+
 // Single localStorage key holding the JSON-serialized settings.
 export const SETTINGS_KEY = 'soniox.settings.v1'
 
 export function mergeSettings(raw: string | null | undefined): AppSettings {
   if (!raw) return { ...DEFAULT_SETTINGS }
   try {
-    const parsed = JSON.parse(raw) as Partial<AppSettings>
-    return { ...DEFAULT_SETTINGS, ...parsed }
+    const parsed = JSON.parse(raw) as Partial<AppSettings> & { showTranscript?: boolean }
+    const s = { ...DEFAULT_SETTINGS, ...parsed }
+    // Migrate the old on/off "show original transcript" switch.
+    if (!parsed.displayMode && parsed.showTranscript === false) s.displayMode = 'translation'
+    if (!DISPLAY_MODES.includes(s.displayMode)) s.displayMode = DEFAULT_SETTINGS.displayMode
+    delete (s as { showTranscript?: boolean }).showTranscript
+    return s
   } catch {
     return { ...DEFAULT_SETTINGS }
   }

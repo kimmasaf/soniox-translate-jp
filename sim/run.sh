@@ -13,6 +13,6 @@ docker image inspect evenhub-sim >/dev/null 2>&1 || docker build -t evenhub-sim 
 rm -rf "$ROOT/sim/out"
 docker run --rm --init \
   -v "$ROOT":/app -v "$(readlink -f "$NODE_DIR")":/opt/node:ro \
-  -e WAIT -e INPUTS -e RUST_LOG -e AUDIO -e TARGET -e SPEAKERS -e CLICKS \
+  -e WAIT -e INPUTS -e RUST_LOG -e AUDIO -e TARGET -e SPEAKERS -e CLICKS -e POST_CLICKS -e MODE \
   --user "$(id -u):$(id -g)" -e HOME=/tmp \
   evenhub-sim bash /app/sim/smoke.sh
