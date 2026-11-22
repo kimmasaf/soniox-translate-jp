@@ -1,7 +1,8 @@
 // Companion phone UI (runs in the Even app's WebView).
 // Standard mobile layout: a caption screen + a separate settings screen made of
 // grouped list rows (iOS/Android settings style). Japanese UI, large type.
-// Font scale: change --base in injectStyles() to resize everything at once.
+// Font scale: --base in injectStyles() sizes everything; --main-scale and
+// --settings-scale shrink/grow the caption and settings screens relative to it.
 import { LANGUAGES, langName } from './languages'
 import type { AppSettings } from './settings'
 
@@ -287,6 +288,10 @@ function injectStyles() {
     :root {
       /* One knob for all text sizes (the old UI used 11-18px; this is ~2x). */
       --base: 24px;
+      /* Settings screen text relative to --base (0.7 = 70%). */
+      --settings-scale: 0.7em;
+      /* Caption (main) screen text relative to --base (0.7 = 70%). */
+      --main-scale: 0.7em;
       color-scheme: light dark;
       --bg: #f2f2f7; --card: #ffffff; --text: #1c1c1e; --sub: #6c6c70; --sep: #d1d1d6;
       --accent: #007aff; --ok: #34c759; --warn: #ff9500; --err: #ff3b30; --interim: #8e8e93;
@@ -302,75 +307,78 @@ function injectStyles() {
       font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Noto Sans JP', system-ui, sans-serif;
       line-height: 1.5; -webkit-text-size-adjust: 100%; }
     [hidden] { display: none !important; }
-    .view { max-width: 720px; margin: 0 auto; padding: 0 0.75rem 1.5rem; box-sizing: border-box;
-      display: flex; flex-direction: column; gap: 0.6rem; min-height: 100vh; }
+    /* Sizes below are in em, so each screen can be scaled on its own. */
+    #view-settings { font-size: var(--settings-scale); }
+    #view-main { font-size: var(--main-scale); }
+    .view { max-width: 720px; margin: 0 auto; padding: 0 0.75em 1.5em; box-sizing: border-box;
+      display: flex; flex-direction: column; gap: 0.6em; min-height: 100vh; }
 
     .bar { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between;
-      gap: 0.5rem; padding: 0.6rem 0; background: var(--bg); }
-    .bar h1 { font-size: 1.25rem; font-weight: 700; margin: 0; }
-    .bar-btn { background: none; border: 0; color: var(--accent); font: inherit; font-size: 1rem;
-      padding: 0.3rem 0; cursor: pointer; min-height: 2rem; }
-    .bar-spacer { width: 3.5rem; }
+      gap: 0.5em; padding: 0.6em 0; background: var(--bg); }
+    .bar h1 { font-size: 1.25em; font-weight: 700; margin: 0; }
+    .bar-btn { background: none; border: 0; color: var(--accent); font: inherit; font-size: 1em;
+      padding: 0.3em 0; cursor: pointer; min-height: 2em; }
+    .bar-spacer { width: 3.5em; }
 
-    .status { display: flex; align-items: center; gap: 0.4rem; font-size: 0.9rem; color: var(--sub); }
-    .status .dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--sub); flex: none; }
+    .status { display: flex; align-items: center; gap: 0.4em; font-size: 0.9em; color: var(--sub); }
+    .status .dot { width: 0.55em; height: 0.55em; border-radius: 50%; background: var(--sub); flex: none; }
     .status-listening .dot { background: var(--ok); }
     .status-listening { color: var(--ok); }
     .status-reconnecting .dot { background: var(--warn); } .status-reconnecting { color: var(--warn); }
     .status-setup .dot { background: var(--warn); } .status-setup { color: var(--warn); }
     .status-error .dot { background: var(--err); } .status-error { color: var(--err); }
 
-    .card { background: var(--card); border-radius: 0.6rem; padding: 0.6rem 0.75rem;
-      display: flex; flex-direction: column; gap: 0.3rem; min-height: 4.5rem; }
+    .card { background: var(--card); border-radius: 0.6em; padding: 0.6em 0.75em;
+      display: flex; flex-direction: column; gap: 0.3em; min-height: 4.5em; }
     .card-primary { flex: 2.5; }
     .card-secondary { flex: 1; }
     .card-head { display: flex; align-items: center; justify-content: space-between; }
-    .card-title { font-size: 0.9rem; font-weight: 600; color: var(--sub); }
+    .card-title { font-size: 0.9em; font-weight: 600; color: var(--sub); }
     .card-body { flex: 1; overflow: auto; max-height: 60vh; white-space: pre-wrap; word-break: break-word;
-      font-size: 1.15rem; line-height: 1.6; }
-    .card-secondary .card-body { font-size: 1rem; color: var(--sub); max-height: 30vh; }
+      font-size: 1.15em; line-height: 1.6; }
+    .card-secondary .card-body { font-size: 1em; color: var(--sub); max-height: 30vh; }
     .interim { color: var(--interim); }
-    .speaker { display: inline-block; font-size: 0.8rem; font-weight: 600; color: var(--accent);
-      background: var(--chip-bg); border-radius: 0.4rem; padding: 0 0.35rem; margin-right: 0.35rem;
+    .speaker { display: inline-block; font-size: 0.7em; font-weight: 600; color: var(--accent);
+      background: var(--chip-bg); border-radius: 0.4em; padding: 0 0.35em; margin-right: 0.35em;
       vertical-align: 0.1em; line-height: 1.5; }
-    .footnote { font-size: 0.85rem; color: var(--sub); text-align: center; margin: 0.3rem 0 0; }
+    .footnote { font-size: 0.85em; color: var(--sub); text-align: center; margin: 0.3em 0 0; }
 
-    .section-title { font-size: 0.85rem; font-weight: 400; color: var(--sub); margin: 0.9rem 0.6rem 0.1rem; }
-    .section-foot { font-size: 0.85rem; color: var(--sub); margin: 0.1rem 0.6rem 0; }
+    .section-title { font-size: 0.85em; font-weight: 400; color: var(--sub); margin: 0.9em 0.6em 0.1em; }
+    .section-foot { font-size: 0.85em; color: var(--sub); margin: 0.1em 0.6em 0; }
     .section-foot a { color: var(--accent); }
-    .group { background: var(--card); border-radius: 0.6rem; overflow: hidden; }
-    .row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
-      min-height: 2.4rem; padding: 0.45rem 0.75rem; box-sizing: border-box; border-top: 1px solid var(--sep); }
+    .group { background: var(--card); border-radius: 0.6em; overflow: hidden; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 0.75em;
+      min-height: 2.4em; padding: 0.45em 0.75em; box-sizing: border-box; border-top: 1px solid var(--sep); }
     .group > .row:first-child { border-top: 0; }
-    .row-stack { flex-direction: column; align-items: stretch; gap: 0.35rem; }
-    .row-text { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }
-    .row-label { font-size: 1rem; }
-    .row-sub { font-size: 0.8rem; color: var(--sub); }
-    .row-select { -webkit-appearance: none; appearance: none; font: inherit; font-size: 1rem; color: var(--sub);
-      background: transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='16' viewBox='0 0 10 16'%3E%3Cpath d='M2 2l6 6-6 6' fill='none' stroke='%238e8e93' stroke-width='2'/%3E%3C/svg%3E") no-repeat right center / 0.4rem auto;
-      border: 0; text-align: right; text-align-last: right; padding: 0.2rem 0.75rem 0.2rem 0; max-width: 60%; cursor: pointer; }
+    .row-stack { flex-direction: column; align-items: stretch; gap: 0.35em; }
+    .row-text { display: flex; flex-direction: column; gap: 0.1em; min-width: 0; }
+    .row-label { font-size: 1em; }
+    .row-sub { font-size: 0.8em; color: var(--sub); }
+    .row-select { -webkit-appearance: none; appearance: none; font: inherit; font-size: 1em; color: var(--sub);
+      background: transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='16' viewBox='0 0 10 16'%3E%3Cpath d='M2 2l6 6-6 6' fill='none' stroke='%238e8e93' stroke-width='2'/%3E%3C/svg%3E") no-repeat right center / 0.4em auto;
+      border: 0; text-align: right; text-align-last: right; padding: 0.2em 0.75em 0.2em 0; max-width: 60%; cursor: pointer; }
     .row-select option { color: initial; }
-    .row input[type=text], .row input[type=password] { font: inherit; font-size: 1rem; color: var(--text);
-      background: var(--bg); border: 1px solid var(--sep); border-radius: 0.4rem; padding: 0.35rem 0.5rem;
+    .row input[type=text], .row input[type=password] { font: inherit; font-size: 1em; color: var(--text);
+      background: var(--bg); border: 1px solid var(--sep); border-radius: 0.4em; padding: 0.35em 0.5em;
       width: 100%; box-sizing: border-box; min-width: 0; }
-    .key-wrap { display: flex; gap: 0.5rem; align-items: center; }
-    .text-btn { background: none; border: 0; color: var(--accent); font: inherit; font-size: 0.9rem;
-      padding: 0.2rem 0.3rem; cursor: pointer; white-space: nowrap; }
+    .key-wrap { display: flex; gap: 0.5em; align-items: center; }
+    .text-btn { background: none; border: 0; color: var(--accent); font: inherit; font-size: 0.9em;
+      padding: 0.2em 0.3em; cursor: pointer; white-space: nowrap; }
 
     /* iOS-style toggle switch on a checkbox */
     .switch { appearance: none; -webkit-appearance: none; flex: none; position: relative; margin: 0;
-      width: 2.15rem; height: 1.3rem; border-radius: 1rem; background: var(--sep); cursor: pointer;
+      width: 2.15em; height: 1.3em; border-radius: 1em; background: var(--sep); cursor: pointer;
       transition: background 0.2s; }
-    .switch::after { content: ''; position: absolute; top: 0.1rem; left: 0.1rem; width: 1.1rem; height: 1.1rem;
+    .switch::after { content: ''; position: absolute; top: 0.1em; left: 0.1em; width: 1.1em; height: 1.1em;
       border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.3); transition: transform 0.2s; }
     .switch:checked { background: var(--ok); }
-    .switch:checked::after { transform: translateX(0.85rem); }
+    .switch:checked::after { transform: translateX(0.85em); }
     @media (prefers-reduced-motion: reduce) { .switch, .switch::after { transition: none; } }
 
-    .primary { margin-top: 1rem; width: 100%; min-height: 2.3rem; border: 0; border-radius: 0.6rem;
-      background: var(--accent); color: #fff; font: inherit; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    .primary { margin-top: 1em; width: 100%; min-height: 2.3em; border: 0; border-radius: 0.6em;
+      background: var(--accent); color: #fff; font: inherit; font-size: 1em; font-weight: 600; cursor: pointer; }
     .primary:active { opacity: 0.8; }
-    .saved { min-height: 1.4em; font-size: 0.9rem; color: var(--ok); text-align: center; margin: 0.3rem 0 0; }
+    .saved { min-height: 1.4em; font-size: 0.9em; color: var(--ok); text-align: center; margin: 0.3em 0 0; }
   `
   const style = document.createElement('style')
   style.textContent = css
