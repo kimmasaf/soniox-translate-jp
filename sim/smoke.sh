@@ -37,7 +37,8 @@ cd /app
 npx vite --host 127.0.0.1 --port 5173 --strictPort >"$OUT/vite.log" 2>&1 & VITE_PID=$!
 for _ in $(seq 1 40); do curl -sf http://127.0.0.1:5173 >/dev/null && break; sleep 0.25; done
 
-RUST_LOG=${RUST_LOG:-info} "$SIM" "http://127.0.0.1:5173/${TARGET:+?target=$TARGET}" --automation-port 9898 --no-aid \
+QS="${TARGET:+target=$TARGET&}${SPEAKERS:+speakers=$SPEAKERS&}"
+RUST_LOG=${RUST_LOG:-info} "$SIM" "http://127.0.0.1:5173/${QS:+?${QS%&}}" --automation-port 9898 --no-aid \
   >"$OUT/simulator.log" 2>&1 & SIM_PID=$!
 for _ in $(seq 1 60); do curl -sf $API/api/ping >/dev/null && break; sleep 0.25; done
 curl -sf $API/api/ping >/dev/null || { echo "simulator did not start"; tail -30 "$OUT/simulator.log"; exit 1; }
@@ -45,6 +46,17 @@ curl -sf $API/api/ping >/dev/null || { echo "simulator did not start"; tail -30 
 sleep "$WAIT"
 curl -sf $API/api/screenshot/glasses -o "$OUT/glasses-0-boot.png"
 curl -sf $API/api/screenshot/webview -o "$OUT/webview-0-boot.png" || true
+import -window root "$OUT/desktop-0-boot.png" 2>/dev/null || true
+
+# CLICKS="747,139 500,600": click desktop coordinates (e.g. phone UI) in order.
+c=0
+for xy in ${CLICKS:-}; do
+  c=$((c+1))
+  if [ "$xy" = scroll ]; then xdotool mousemove 500 600 click --repeat 15 --delay 50 5   # wheel down
+  else xdotool mousemove ${xy%,*} ${xy#*,} click 1; fi
+  sleep 1.5
+  import -window root "$OUT/desktop-c$c.png" 2>/dev/null || true
+done
 
 # Feed each WAV in real time (strip 44-byte header), screenshot midway + after.
 n=0
@@ -60,6 +72,7 @@ for f in ${AUDIO:-}; do
   ( while :; do head -c 3200 /dev/zero; sleep 0.1; done ) > $VMIC & SILENCE_PID=$!
   sleep 4; curl -sf $API/api/screenshot/glasses -o "$OUT/glasses-a$n-$tag-end.png"
   curl -sf $API/api/screenshot/webview -o "$OUT/webview-a$n-$tag-end.png" || true
+  import -window root "$OUT/desktop-a$n-$tag-end.png" 2>/dev/null || true
 done
 
 i=1

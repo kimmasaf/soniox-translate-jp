@@ -13,7 +13,7 @@ export interface AppSettings {
   noTranslateLangs: string[]
   /** Newline per sentence (at . ? ! + Soniox pauses). */
   splitSentences: boolean
-  /** Speaker diarization with per-speaker icons. */
+  /** Speaker diarization; labels are shown on the phone only (never on the glasses). */
   speakerLabels: boolean
   /** Horizontal text alignment on the glasses ('center' is faked via space padding). */
   align: 'left' | 'center'
@@ -29,7 +29,7 @@ export interface AppSettings {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   apiKey: '',
-  targetLang: 'en',
+  targetLang: 'ja',
   showTranscript: true,
   noTranslateLangs: [],
   splitSentences: true,

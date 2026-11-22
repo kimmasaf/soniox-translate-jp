@@ -8,7 +8,12 @@ import {
 } from '@evenrealities/even_hub_sdk'
 import { getTextWidth } from '@evenrealities/pretext'
 import { startSttStream, type SttClient } from './asr/stt'
-import { mountUi, setStatus, setTranscript, setTranslation, setTargetLangLabel } from './ui'
+import { mountUi, setStatus, setTranscript, setTranslation, setTargetLangLabel, formatSpeaker } from './ui'
+import type { SttSnapshot } from './asr/stt'
+
+// Glasses placeholders (the G2 font has kana/kanji but not symbols like ⚙).
+const PH_LISTEN = '聞き取り中…'
+const PH_TRANSLATE = '翻訳を待っています…'
 import { type AppSettings, SETTINGS_KEY, mergeSettings } from './settings'
 
 const bridge = await waitForEvenAppBridge()
@@ -47,10 +52,12 @@ async function loadSettings(): Promise<AppSettings> {
     const devKey = (import.meta.env.VITE_STT_API_KEY as string) || ''
     if (devKey) s.apiKey = devKey
   }
-  // Dev-only: `?target=ja` overrides the translation target (used by sim/run.sh).
+  // Dev-only URL overrides (used by sim/run.sh): `?target=ja&speakers=1`.
   if (import.meta.env.DEV) {
-    const t = new URLSearchParams(location.search).get('target')
+    const q = new URLSearchParams(location.search)
+    const t = q.get('target')
     if (t !== null) s.targetLang = t
+    if (q.get('speakers') !== null) s.speakerLabels = q.get('speakers') === '1'
   }
   return s
 }
@@ -59,7 +66,7 @@ let settings = await loadSettings()
 mountUi({ settings, onSave: handleSave })
 
 // ── Render state ─────────────────────────────────────────────────────────────
-let curTranscript = 'Starting…'
+let curTranscript = '起動中…'
 let curTranslation = '…'
 let lastTranscript = ''
 let lastTranslation = ''
@@ -200,10 +207,10 @@ function fitTail(text: string, placeholder: string, visibleLines: number, paneLi
 }
 
 function recomputeDisplay() {
-  if (hasTranscript) curTranscript = fitTail(rawTx, 'Listening…', transcriptLines, transcriptLines)
+  if (hasTranscript) curTranscript = fitTail(rawTx, PH_LISTEN, transcriptLines, transcriptLines)
   const visible = settings.maxLines > 0 ? Math.min(translationLines, settings.maxLines) : translationLines
   const primary = settings.targetLang ? rawTl : rawTx
-  curTranslation = fitTail(primary, settings.targetLang ? 'Translation…' : 'Listening…', visible, translationLines)
+  curTranslation = fitTail(primary, settings.targetLang ? PH_TRANSLATE : PH_LISTEN, visible, translationLines)
 }
 
 // ── Glasses render (debounced + coalesced; never overlapping) ────────────────
@@ -258,19 +265,18 @@ function forceRender() {
 let stt: SttClient | null = null
 let micOn = false
 
-function onSnapshot({ transcriptFinal, transcriptInterim, translationFinal, translationInterim }: {
-  transcriptFinal: string; transcriptInterim: string; translationFinal: string; translationInterim: string
-}) {
-  rawTx = transcriptFinal + transcriptInterim
-  rawTl = translationFinal + translationInterim
+function onSnapshot(s: SttSnapshot) {
+  // Glasses: unlabeled text. Phone: speaker-labeled text.
+  rawTx = s.transcriptFinal + s.transcriptInterim
+  rawTl = s.translationFinal + s.translationInterim
   recomputeDisplay()
-  setTranscript(transcriptFinal, transcriptInterim)
-  setTranslation(translationFinal, translationInterim)
+  setTranscript(s.transcriptLabeled, s.transcriptInterim)
+  setTranslation(s.translationLabeled, s.translationInterim)
   scheduleGlassesRender()
 }
 
 function onSttError(err: unknown) {
-  setStatus('error', `STT: ${(err as Error)?.message ?? err}`)
+  setStatus('error', `音声認識: ${(err as Error)?.message ?? err}`)
   console.error('STT error:', err)
 }
 
@@ -284,10 +290,10 @@ function applySettings() {
       serial('audioOff', () => bridge.audioControl(false))
       micOn = false
     }
-    curTranscript = '⚙ Setup needed'
-    curTranslation = 'Open this app on your phone → Settings, and add your Soniox API key.'
+    curTranscript = '設定が必要です'
+    curTranslation = 'スマートフォンでこのアプリを開き、設定画面で Soniox の API キーを入力してください。'
     forceRender()
-    setStatus('setup', 'Add your Soniox API key in Settings')
+    setStatus('setup', '設定画面で Soniox の API キーを入力してください')
     return
   }
 
@@ -299,13 +305,14 @@ function applySettings() {
         splitSentences: settings.splitSentences,
         speakerLabels: settings.speakerLabels,
         noTranslateLangs: settings.noTranslateLangs,
+        formatSpeaker,
       },
       onSnapshot,
       onSttError,
       status => {
-        if (status === 'live') setStatus('listening', 'Microphone live · double-tap the temple to exit')
-        else if (status === 'connecting') setStatus('connecting', 'Connecting to Soniox…')
-        else if (status === 'reconnecting') setStatus('reconnecting', 'Reconnecting…')
+        if (status === 'live') setStatus('listening', 'マイク入力中・テンプルをダブルタップで終了')
+        else if (status === 'connecting') setStatus('connecting', 'Soniox に接続中…')
+        else if (status === 'reconnecting') setStatus('reconnecting', '接続が切れたため再接続しています')
       },
     )
   } catch (err) {
@@ -337,8 +344,8 @@ async function handleSave(next: AppSettings) {
   if (needRestart) {
     rawTx = ''
     rawTl = ''
-    curTranscript = 'Listening…'
-    curTranslation = next.targetLang ? 'Translation…' : 'Listening…'
+    curTranscript = PH_LISTEN
+    curTranslation = next.targetLang ? PH_TRANSLATE : PH_LISTEN
     if (needRebuild) await applyLayout()
     else forceRender()
     applySettings()

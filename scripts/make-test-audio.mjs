@@ -3,7 +3,7 @@
 // G2 mic's native format (PCM s16le, 16 kHz, mono), saved as WAV.
 //
 // Usage:  node scripts/make-test-audio.mjs
-// Output: test-audio/en.wav, test-audio/ja.wav
+// Output: test-audio/en.wav, test-audio/ja.wav, test-audio/dialog.wav (2 speakers, ja+en)
 // Key:    $SONIOX_API_KEY, else VITE_STT_API_KEY from .env.local
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 
@@ -55,20 +55,45 @@ const key = loadKey()
 if (!key) { console.error('No Soniox key (set SONIOX_API_KEY or .env.local)'); process.exit(1) }
 mkdirSync(OUT_DIR, { recursive: true })
 
-for (const c of CLIPS) {
+// Two speakers (different voices), Japanese + English mixed: exercises speaker
+// labels and "target-language speech is shown once" with target = ja.
+CLIPS.push({
+  name: 'dialog',
+  segments: [
+    { voice: VOICE, language: 'ja', text: 'では、さっそく始めましょう。今日のテーマは新しいサービスです。' },
+    { voice: VOICE2(), language: 'en', text: 'Great. I have a few questions about the pricing model.' },
+    { voice: VOICE, language: 'ja', text: 'もちろんです。料金は使った分だけのお支払いです。' },
+    { voice: VOICE2(), language: 'en', text: 'That sounds good. Is there a free tier?' },
+  ],
+})
+function VOICE2() { return process.env.SONIOX_TTS_VOICE2 || 'Adrian' }
+
+async function tts(language, voice, text) {
   const res = await fetch(TTS_URL, {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: MODEL, language: c.language, voice: VOICE,
-      audio_format: 'pcm_s16le', sample_rate: 16000, text: c.text,
+      model: MODEL, language, voice,
+      audio_format: 'pcm_s16le', sample_rate: 16000, text,
     }),
   })
   if (!res.ok) {
-    console.error(`${c.name}: HTTP ${res.status} ${await res.text()}`)
+    console.error(`TTS ${language}/${voice}: HTTP ${res.status} ${await res.text()}`)
     process.exit(1)
   }
-  const pcm = Buffer.from(await res.arrayBuffer())
+  return Buffer.from(await res.arrayBuffer())
+}
+
+const GAP = Buffer.alloc(16000 * 2 * 0.8) // 0.8 s silence between turns
+
+for (const c of CLIPS) {
+  const segs = c.segments ?? [{ voice: VOICE, language: c.language, text: c.text }]
+  const parts = []
+  for (const s of segs) {
+    if (parts.length) parts.push(GAP)
+    parts.push(await tts(s.language, s.voice, s.text))
+  }
+  const pcm = Buffer.concat(parts)
   const file = new URL(`${c.name}.wav`, OUT_DIR)
   writeFileSync(file, wavFromPcm(pcm))
   console.log(`${c.name}: ${(pcm.length / 32000).toFixed(1)}s → ${file.pathname}`)
