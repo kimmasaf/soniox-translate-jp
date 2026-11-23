@@ -14,7 +14,7 @@
 //
 // Env:
 //   SONIOX_API_KEY     key (else read from .env.local's VITE_STT_API_KEY)
-//   SONIOX_MODEL       default stt-rt-v4
+//   SONIOX_MODEL       default stt-rt-v6
 //   SONIOX_TRANSLATE_TO  e.g. "en" → enable one-way translation
 //   SONIOX_LANGUAGES   comma-separated source hints (default: en, or none in translate mode)
 //   SAY_VOICE          macOS voice, e.g. "Mónica" (es), "Thomas" (fr), "Anna" (de)
@@ -22,7 +22,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 
 const TEXT = process.argv[2] || 'Testing, one two three. The quick brown fox jumps over the lazy dog.'
-const MODEL = process.env.SONIOX_MODEL || 'stt-rt-v4'
+const MODEL = process.env.SONIOX_MODEL || 'stt-rt-v6'
 const TRANSLATE_TO = (process.env.SONIOX_TRANSLATE_TO || '').trim()
 const VOICE = (process.env.SAY_VOICE || '').trim()
 const LANG_HINTS = (process.env.SONIOX_LANGUAGES ?? (TRANSLATE_TO ? '' : 'en'))
@@ -58,11 +58,18 @@ if (!key) {
   process.exit(1)
 }
 
-console.log(`Synthesizing speech${VOICE ? ` (voice ${VOICE})` : ''}: "${TEXT}"`)
-const voiceArg = VOICE ? `-v ${JSON.stringify(VOICE)} ` : ''
-execSync(`say ${voiceArg}-o /tmp/soniox-test.aiff ${JSON.stringify(TEXT)}`)
-execSync('afconvert /tmp/soniox-test.aiff -d LEI16@16000 -c 1 -f WAVE /tmp/soniox-test.wav')
-const pcm = pcmFromWav(readFileSync('/tmp/soniox-test.wav'))
+// AUDIO_FILE=test-audio/ja.wav → stream an existing 16 kHz mono s16le WAV
+// instead of synthesizing with macOS `say` (works on Linux).
+const AUDIO_FILE = (process.env.AUDIO_FILE || '').trim()
+if (AUDIO_FILE) {
+  console.log(`Using audio file: ${AUDIO_FILE}`)
+} else {
+  console.log(`Synthesizing speech${VOICE ? ` (voice ${VOICE})` : ''}: "${TEXT}"`)
+  const voiceArg = VOICE ? `-v ${JSON.stringify(VOICE)} ` : ''
+  execSync(`say ${voiceArg}-o /tmp/soniox-test.aiff ${JSON.stringify(TEXT)}`)
+  execSync('afconvert /tmp/soniox-test.aiff -d LEI16@16000 -c 1 -f WAVE /tmp/soniox-test.wav')
+}
+const pcm = pcmFromWav(readFileSync(AUDIO_FILE || '/tmp/soniox-test.wav'))
 console.log(`PCM: ${pcm.length} bytes (${(pcm.length / 2 / 16000).toFixed(1)}s @ 16kHz mono s16le)`)
 console.log(`Connecting to Soniox (model ${MODEL}${TRANSLATE_TO ? `, translate→${TRANSLATE_TO}` : ''})…`)
 
@@ -87,6 +94,8 @@ ws.onopen = async () => {
   }
   if (LANG_HINTS.length) config.language_hints = LANG_HINTS
   if (TRANSLATE_TO) config.translation = { type: 'one_way', target_language: TRANSLATE_TO }
+  // SONIOX_CONTEXT='{"terms":["Kiro"],"translation_terms":[{"source":"demo","target":"デモ"}]}'
+  if (process.env.SONIOX_CONTEXT) config.context = JSON.parse(process.env.SONIOX_CONTEXT)
   ws.send(JSON.stringify(config))
 
   const CHUNK = 3200 // 100 ms

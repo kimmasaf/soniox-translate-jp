@@ -4,8 +4,9 @@
 // WebSocket API (pcm_s16le @ 16000 natively — no resampling). With one-way
 // translation, Soniox returns original (translation_status "original") and
 // translated ("translation") tokens; we split them into transcript + translation
-// streams, mirror already-target-language speech, and drop translations of
-// keep-as-is languages (via source_language).
+// streams, route already-target-language speech to the translation stream only
+// (shown once, not duplicated), and drop translations of keep-as-is languages
+// (via source_language).
 //
 // Robustness:
 //   • Auto-reconnect with exponential backoff on unexpected drops — the
@@ -17,8 +18,11 @@
 // Docs: https://soniox.com/docs/stt/rt/real-time-transcription
 //       https://soniox.com/docs/stt/rt/real-time-translation
 
+import type { Pair } from '../paired'
+
 const SONIOX_WS_URL = 'wss://stt-rt.soniox.com/transcribe-websocket'
-const DEFAULT_MODEL = 'stt-rt-v4'
+// Latest real-time model (Nov 2026). See https://docs.soniox.com/stt/models
+const DEFAULT_MODEL = 'stt-rt-v6'
 const SPEAKER_ICONS = ['●', '■', '★', '▲', '♦', '♥', '♣', '♠']
 const MAX_PENDING_CHUNKS = 50 // ~5s of audio buffered while (re)connecting
 const BACKPRESSURE_BYTES = 256_000 // ~8s of audio; drop frames past this
@@ -40,13 +44,27 @@ export interface SttOptions {
   noTranslateLangs?: string[]
   /** Soniox real-time model id. */
   model?: string
+  /** Speaker label for the labeled stream (0-based order of appearance). */
+  formatSpeaker?: (index: number) => string
+  /** Soniox context object (general / text / terms / translation_terms). */
+  context?: object
 }
 
 export interface SttSnapshot {
+  /** Unlabeled text (glasses): a speaker change only starts a new line. */
   transcriptFinal: string
   transcriptInterim: string
   translationFinal: string
   translationInterim: string
+  /** Same text with a speaker label at each speaker change (phone UI). */
+  transcriptLabeled: string
+  translationLabeled: string
+  /** Final utterances as original/translation pairs (Bilingual Paired view + history). */
+  pairs: Pair[]
+  /** Interim same-language text (also included in translationInterim). */
+  sameInterim: string
+  /** Interim translation of foreign speech only (translationInterim minus sameInterim). */
+  foreignTranslationInterim: string
   finished: boolean
 }
 
@@ -101,12 +119,57 @@ export function startSttStream(
     onError?.(new Error('Soniox API key missing — set it in Settings'))
   }
 
+  const formatSpeaker = opts.formatSpeaker ?? ((i: number) => SPEAKER_ICONS[i % SPEAKER_ICONS.length] + ' ')
+
   // Persistent across reconnects so the transcript continues uninterrupted.
+  // Two parallel streams: plain (glasses) and labeled (phone).
   let transcriptFinal = ''
   let translationFinal = ''
+  let transcriptLabeled = ''
+  let translationLabeled = ''
   let lastSpkTx: string | null = null
   let lastSpkTl: string | null = null
   const spkOrder = new Map<string, number>()
+
+  // Bilingual pairs. Soniox does not tag which translation belongs to which
+  // original, so: an original starts a new pair once the current pair already
+  // has translation (or the speaker changed); a translation attaches to the
+  // latest foreign-language pair. If speech resumes before a translation
+  // arrives, two utterances merge into one pair — never misaligned.
+  const pairs: Pair[] = []
+  const MAX_PAIRS = 3000
+  function spkIndex(spk?: string): number | undefined {
+    if (!speakerLabels || !spk) return undefined
+    if (!spkOrder.has(spk)) spkOrder.set(spk, spkOrder.size)
+    return spkOrder.get(spk)
+  }
+  function pairOrig(text: string, spk?: string) {
+    const s = spkIndex(spk)
+    const last = pairs[pairs.length - 1]
+    if (!last || last.same || last.trans || (s !== undefined && last.orig && last.speaker !== s)) {
+      pairs.push({ speaker: s, at: Date.now(), orig: text.trimStart(), trans: '', same: false })
+    } else {
+      last.orig += text
+    }
+  }
+  function pairTrans(text: string) {
+    for (let i = pairs.length - 1; i >= 0; i--) {
+      if (!pairs[i].same) {
+        pairs[i].trans += pairs[i].trans ? text : text.trimStart()
+        return
+      }
+    }
+    pairs.push({ at: Date.now(), orig: '', trans: text.trimStart(), same: false })
+  }
+  function pairSame(text: string, spk?: string) {
+    const s = spkIndex(spk)
+    const last = pairs[pairs.length - 1]
+    if (!last || !last.same || (s !== undefined && last.speaker !== s)) {
+      pairs.push({ speaker: s, at: Date.now(), orig: '', trans: text.trimStart(), same: true })
+    } else {
+      last.trans += text
+    }
+  }
 
   let ws: WebSocket | null = null
   let configSent = false
@@ -116,25 +179,28 @@ export function startSttStream(
   let reconnectTimer: number | null = null
   const pending: Uint8Array[] = []
 
-  function speakerIcon(spk: string): string {
+  function speakerLabel(spk: string): string {
     if (!spkOrder.has(spk)) spkOrder.set(spk, spkOrder.size)
-    return SPEAKER_ICONS[spkOrder.get(spk)! % SPEAKER_ICONS.length]
+    return formatSpeaker(spkOrder.get(spk)!)
   }
+  const nl = (s: string) => (s && !s.endsWith('\n') ? s + '\n' : s)
   function appendTranscript(text: string, speaker?: string) {
     if (speakerLabels && speaker && speaker !== lastSpkTx) {
-      if (transcriptFinal && !transcriptFinal.endsWith('\n')) transcriptFinal += '\n'
-      transcriptFinal += speakerIcon(speaker) + ' '
+      transcriptFinal = nl(transcriptFinal)
+      transcriptLabeled = nl(transcriptLabeled) + speakerLabel(speaker)
       lastSpkTx = speaker
     }
     transcriptFinal += text
+    transcriptLabeled += text
   }
   function appendTranslation(text: string, speaker?: string) {
     if (speakerLabels && speaker && speaker !== lastSpkTl) {
-      if (translationFinal && !translationFinal.endsWith('\n')) translationFinal += '\n'
-      translationFinal += speakerIcon(speaker) + ' '
+      translationFinal = nl(translationFinal)
+      translationLabeled = nl(translationLabeled) + speakerLabel(speaker)
       lastSpkTl = speaker
     }
     translationFinal += text
+    translationLabeled += text
   }
 
   function buildConfig(): string {
@@ -147,6 +213,7 @@ export function startSttStream(
       enable_endpoint_detection: true,
     }
     if (languageHints.length) config.language_hints = languageHints
+    if (opts.context) config.context = opts.context
     if (targetLang) {
       config.translation = { type: 'one_way', target_language: targetLang }
       config.enable_language_identification = true
@@ -174,36 +241,69 @@ export function startSttStream(
 
     let transcriptInterim = ''
     let translationInterim = ''
+    let sameInterim = ''
+    let foreignTranslationInterim = ''
     for (const t of res.tokens ?? []) {
       const text = t.text
       if (!text) continue
       const isTranslation = t.translation_status === 'translation'
       if (isControlToken(text)) {
         if (splitSentences && t.is_final && /^<(end|fin)>$/i.test(text)) {
-          if (transcriptFinal && !transcriptFinal.endsWith('\n')) transcriptFinal += '\n'
+          transcriptFinal = nl(transcriptFinal)
+          transcriptLabeled = nl(transcriptLabeled)
         }
         continue
       }
       if (isTranslation) {
         if (noTranslate.includes(t.source_language ?? '')) continue
-        if (t.is_final) appendTranslation(text, t.speaker)
-        else translationInterim += text
+        if (t.is_final) {
+          appendTranslation(text, t.speaker)
+          pairTrans(text)
+        } else {
+          translationInterim += text
+          foreignTranslationInterim += text
+        }
       } else {
-        if (t.is_final) appendTranscript(text, t.speaker)
-        else transcriptInterim += text
+        // Speech already in the target language (or a keep-as-is language)
+        // needs no translation: show it ONCE, in the translation stream only,
+        // instead of duplicating it in the original-language stream.
         const keepAsIs = targetLang && (t.language === targetLang || noTranslate.includes(t.language ?? ''))
         if (keepAsIs) {
-          if (t.is_final) appendTranslation(text, t.speaker)
-          else translationInterim += text
+          if (t.is_final) {
+            appendTranslation(text, t.speaker)
+            pairSame(text, t.speaker)
+          } else {
+            translationInterim += text
+            sameInterim += text
+          }
+        } else {
+          if (t.is_final) {
+            appendTranscript(text, t.speaker)
+            // Transcript-only mode: record as single-line entries for history.
+            if (targetLang) pairOrig(text, t.speaker)
+            else pairSame(text, t.speaker)
+          } else {
+            transcriptInterim += text
+          }
         }
       }
     }
 
-    if (transcriptFinal.length > 100_000) transcriptFinal = transcriptFinal.slice(-100_000)
-    if (translationFinal.length > 100_000) translationFinal = translationFinal.slice(-100_000)
+    const cap = (s: string) => (s.length > 100_000 ? s.slice(-100_000) : s)
+    transcriptFinal = cap(transcriptFinal)
+    translationFinal = cap(translationFinal)
+    transcriptLabeled = cap(transcriptLabeled)
+    translationLabeled = cap(translationLabeled)
+
+    if (pairs.length > MAX_PAIRS) pairs.splice(0, pairs.length - MAX_PAIRS)
 
     if (res.finished) console.info('[soniox] stream finished')
-    onSnapshot({ transcriptFinal, transcriptInterim, translationFinal, translationInterim, finished: !!res.finished })
+    onSnapshot({
+      transcriptFinal, transcriptInterim, translationFinal, translationInterim,
+      transcriptLabeled, translationLabeled,
+      pairs, sameInterim, foreignTranslationInterim,
+      finished: !!res.finished,
+    })
   }
 
   function connect() {
@@ -223,7 +323,9 @@ export function startSttStream(
       console.info(
         `[soniox] connected — model ${model}` +
           (targetLang ? `, translate→${targetLang}` : '') +
-          (speakerLabels ? ', diarization on' : ''),
+          (speakerLabels ? ', diarization on' : '') +
+          (languageHints.length ? `, hints ${languageHints.join('/')}` : '') +
+          (opts.context ? `, context ${Object.keys(opts.context).join('/')}` : ''),
       )
       // Flush buffered audio captured during (re)connect.
       for (const chunk of pending) sock.send(chunk)

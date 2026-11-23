@@ -1,220 +1,503 @@
+// Companion phone UI (runs in the Even app's WebView).
+// Standard mobile layout: a caption screen + a separate settings screen made of
+// grouped list rows (iOS/Android settings style). Japanese UI, large type.
+// Font scale: --base in injectStyles() sizes everything; --main-scale and
+// --settings-scale shrink/grow the caption and settings screens relative to it.
 import { LANGUAGES, langName } from './languages'
-import type { AppSettings } from './settings'
+import { type AppSettings, type DisplayMode, DISPLAY_MODES, hasOriginalPane } from './settings'
+import { type PairView, fmtClock, pairedExportText } from './paired'
+import { type SessionMeta, type SessionRecord, exportText, fmtDateTime, fmtTime } from './history'
 
-type Status = 'connecting' | 'listening' | 'error' | 'setup' | 'reconnecting'
-
-const STATUS_LABEL: Record<Status, string> = {
-  connecting: 'Connecting',
-  listening: 'Live',
-  reconnecting: 'Reconnecting',
-  error: 'Error',
-  setup: 'Setup',
+const MODE_LABEL: Record<DisplayMode, string> = {
+  split: '上下分割(原文 2 行)',
+  split37: '上下分割(原文 3:翻訳 7)',
+  paired: '対訳(Bilingual Paired)',
+  translation: '翻訳のみ(全画面)',
 }
 
-let statusEl: HTMLDivElement
-let txFinalEl: HTMLSpanElement
-let txInterimEl: HTMLSpanElement
-let tlFinalEl: HTMLSpanElement
-let tlInterimEl: HTMLSpanElement
-let tlLabelEl: HTMLDivElement
+type Status = 'connecting' | 'listening' | 'error' | 'setup' | 'reconnecting' | 'paused'
+
+const STATUS_LABEL: Record<Status, string> = {
+  paused: '一時停止中',
+  connecting: '接続中',
+  listening: '翻訳中',
+  reconnecting: '再接続中',
+  error: 'エラー',
+  setup: '要設定',
+}
+
+/** Speaker label used in the phone transcript (the glasses never show it). */
+export const formatSpeaker = (i: number) => `話者${i + 1}: `
+const SPEAKER_RE = /^(話者\d+): /
+
+const PHONE_TAIL = 6000 // chars rendered per pane (full text kept for Copy)
+
+let statusEl: HTMLElement
+let statusTextEl: HTMLElement
+let txBodyEl: HTMLElement
+let tlBodyEl: HTMLElement
+let tlLabelEl: HTMLElement
 let secondaryEl: HTMLElement
+let primaryEl: HTMLElement
+let pairedEl: HTMLElement
+let pairedBodyEl: HTMLElement
+let tlFull = ''
+let pairedFull: PairView[] = []
+
+export interface HistoryHandlers {
+  list(): Promise<SessionMeta[]>
+  get(id: number): Promise<SessionRecord | null>
+  remove(id: number): Promise<void>
+  removeAll(): Promise<void>
+  /** Id of the session being recorded right now (shown as 記録中). */
+  currentId(): number | null
+}
 
 export interface UiHandlers {
   settings: AppSettings
   onSave: (next: AppSettings) => void
+  history: HistoryHandlers
 }
 
-export function mountUi({ settings, onSave }: UiHandlers) {
+const opt = (v: string | number, label: string, sel: string | number) =>
+  `<option value="${v}"${String(v) === String(sel) ? ' selected' : ''}>${label}</option>`
+
+function selectRow(id: string, label: string, options: string) {
+  return `<label class="row" for="${id}"><span class="row-label">${label}</span>
+    <select id="${id}" class="row-select">${options}</select></label>`
+}
+function switchRow(id: string, label: string, checked: boolean, sub = '') {
+  return `<label class="row" for="${id}"><span class="row-text"><span class="row-label">${label}</span>${
+    sub ? `<span class="row-sub">${sub}</span>` : ''
+  }</span><input id="${id}" type="checkbox" class="switch"${checked ? ' checked' : ''}/></label>`
+}
+
+export function mountUi({ settings, onSave, history }: UiHandlers) {
   const app = document.querySelector<HTMLDivElement>('#app')!
-  const langOptions = LANGUAGES.map(
-    l => `<option value="${l.code}"${l.code === settings.targetLang ? ' selected' : ''}>${l.name}</option>`,
-  ).join('')
-  const opt = (n: number, label: string, sel: number) =>
-    `<option value="${n}"${n === sel ? ' selected' : ''}>${label}</option>`
+  const langOptions = LANGUAGES.map(l => opt(l.code, l.name, settings.targetLang)).join('')
 
   app.innerHTML = `
-    <main class="panel">
-      <header>
-        <h1>Soniox Translate</h1>
-        <div id="status" class="status status-connecting">Connecting…</div>
+    <div id="view-main" class="view">
+      <header class="bar">
+        <h1>Soniox 翻訳</h1>
+        <span class="bar-actions">
+          <button id="openHistory" type="button" class="bar-btn">履歴</button>
+          <button id="openSettings" type="button" class="bar-btn" aria-label="設定">⚙︎ 設定</button>
+        </span>
+      </header>
+      <div id="status" class="status status-connecting"><span class="dot"></span><span id="status-text">接続中</span></div>
+
+      <section id="pane-paired" class="card card-primary" aria-live="polite" hidden>
+        <div class="card-head">
+          <span class="card-title">対訳</span>
+          <button id="copyPaired" type="button" class="text-btn">コピー</button>
+        </div>
+        <div id="paired-body" class="card-body paired"></div>
+      </section>
+      <section id="pane-primary" class="card card-primary" aria-live="polite">
+        <div class="card-head">
+          <span id="tl-label" class="card-title"></span>
+          <button id="copyTl" type="button" class="text-btn">コピー</button>
+        </div>
+        <div id="tl-body" class="card-body"></div>
+      </section>
+      <section id="pane-secondary" class="card card-secondary" aria-live="polite">
+        <div class="card-head"><span class="card-title">原文</span></div>
+        <div id="tx-body" class="card-body"></div>
+      </section>
+      <p class="footnote">メガネのテンプルをタップで開始/一時停止、ダブルタップで終了</p>
+    </div>
+
+    <div id="view-settings" class="view" hidden>
+      <header class="bar">
+        <button id="closeSettings" type="button" class="bar-btn">‹ 戻る</button>
+        <h1>設定</h1>
+        <span class="bar-spacer"></span>
       </header>
 
-      <details id="settings" class="settings"${settings.apiKey ? '' : ' open'}>
-        <summary>Settings</summary>
-
-        <div class="group-title">Soniox</div>
-        <div class="field">
-          <label for="apiKey">API key</label>
+      <h2 class="section-title">Soniox</h2>
+      <div class="group">
+        <div class="row row-stack">
+          <label class="row-label" for="apiKey">API キー</label>
           <div class="key-wrap">
             <input id="apiKey" type="password" autocomplete="off" autocapitalize="off"
-              spellcheck="false" placeholder="paste your Soniox key" value="${escapeAttr(settings.apiKey)}" />
-            <button id="revealKey" type="button" class="ghost">Show</button>
+              spellcheck="false" placeholder="Soniox の API キーを貼り付け" value="${escapeAttr(settings.apiKey)}" />
+            <button id="revealKey" type="button" class="text-btn">表示</button>
           </div>
-          <p class="hint">Your key, your usage — free at
-            <a href="https://console.soniox.com" target="_blank" rel="noreferrer">console.soniox.com</a>.
-            Stored only on this phone.</p>
         </div>
-        <div class="field">
-          <label for="lang">Translate to</label>
-          <select id="lang">${langOptions}</select>
-        </div>
-        <div class="field">
-          <label for="notranslate">Don't translate (keep original)</label>
+      </div>
+      <p class="section-foot">キーは <a href="https://console.soniox.com" target="_blank" rel="noreferrer">console.soniox.com</a>
+        で無料で取得できます。このスマートフォン内にのみ保存されます。</p>
+
+      <h2 class="section-title">翻訳</h2>
+      <div class="group">
+        ${selectRow('lang', '翻訳先', langOptions)}
+        <div class="row row-stack">
+          <label class="row-label" for="notranslate">翻訳しない言語</label>
           <input id="notranslate" type="text" autocapitalize="off" spellcheck="false"
-            placeholder="e.g. es, fr" value="${escapeAttr(settings.noTranslateLangs.join(', '))}" />
-          <p class="hint">Language codes to leave untranslated. The target is always kept as-is.</p>
+            placeholder="例: en, zh" value="${escapeAttr(settings.noTranslateLangs.join(', '))}" />
         </div>
+      </div>
+      <p class="section-foot">言語コードをカンマ区切りで入力します。翻訳先と同じ言語の発話は、翻訳せずそのまま 1 回だけ表示します。</p>
 
-        <div class="group-title">Glasses display</div>
-        <div class="row">
-          <div class="field">
-            <label for="align">Alignment</label>
-            <select id="align">
-              <option value="left"${settings.align === 'left' ? ' selected' : ''}>Left</option>
-              <option value="center"${settings.align === 'center' ? ' selected' : ''}>Center</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="valign">Anchor</label>
-            <select id="valign">
-              <option value="bottom"${settings.vAlign === 'bottom' ? ' selected' : ''}>Bottom</option>
-              <option value="top"${settings.vAlign === 'top' ? ' selected' : ''}>Top</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="linegap">Line spacing</label>
-            <select id="linegap">${opt(0, 'Normal', settings.lineGap)}${opt(1, 'Relaxed', settings.lineGap)}${opt(2, 'Loose', settings.lineGap)}</select>
-          </div>
-          <div class="field">
-            <label for="width">Text width</label>
-            <select id="width">${opt(100, 'Full', settings.widthPct)}${opt(85, 'Wide', settings.widthPct)}${opt(70, 'Medium', settings.widthPct)}${opt(55, 'Narrow', settings.widthPct)}</select>
-          </div>
-          <div class="field">
-            <label for="maxlines">Max lines</label>
-            <select id="maxlines">${[0, 1, 2, 3, 4, 5, 6, 8].map(n => opt(n, n === 0 ? 'Auto' : String(n), settings.maxLines)).join('')}</select>
-          </div>
+      <h2 class="section-title">認識の精度(言語ヒント・文脈)</h2>
+      <div class="group">
+        <div class="row row-stack">
+          <label class="row-label" for="hints">話される言語</label>
+          <input id="hints" type="text" autocapitalize="off" spellcheck="false"
+            placeholder="例: ja, en" value="${escapeAttr(settings.languageHints.join(', '))}" />
         </div>
-        <label class="check"><input id="showtx" type="checkbox"${settings.showTranscript ? ' checked' : ''}/> Show original transcript <span class="dim">(off = translation full-screen)</span></label>
-        <label class="check"><input id="split" type="checkbox"${settings.splitSentences ? ' checked' : ''}/> Split sentences onto new lines</label>
-        <label class="check"><input id="speakers" type="checkbox"${settings.speakerLabels ? ' checked' : ''}/> Label speakers <span class="dim">(● ■ ★ … — needs 2+ speakers)</span></label>
-
-        <div class="actions">
-          <button id="save" type="button" class="primary">Save</button>
-          <span id="saved" class="saved"></span>
+        <div class="row row-stack">
+          <label class="row-label" for="ctxTopic">話題・分野</label>
+          <input id="ctxTopic" type="text" spellcheck="false"
+            placeholder="例: AWS のクラウドサービスの商談" value="${escapeAttr(settings.ctxTopic)}" />
         </div>
-      </details>
-
-      <section class="pane pane-translation pane-primary" aria-live="polite">
-        <div class="pane-head">
-          <div id="tl-label" class="pane-label">Translation · ${langName(settings.targetLang)}</div>
-          <button id="copyTl" type="button" class="ghost">Copy</button>
+        <div class="row row-stack">
+          <label class="row-label" for="ctxTerms">用語・固有名詞</label>
+          <textarea id="ctxTerms" rows="3" spellcheck="false"
+            placeholder="1 行に 1 つ(カンマ区切りも可)&#10;例: Amazon Bedrock&#10;Kiro">${escapeText(settings.ctxTerms)}</textarea>
         </div>
-        <div class="pane-body"><span id="tl-final"></span><span id="tl-interim" class="interim"></span></div>
-      </section>
-      <section class="pane pane-secondary" aria-live="polite">
-        <div class="pane-label">Transcript · original</div>
-        <div class="pane-body"><span id="tx-final"></span><span id="tx-interim" class="interim"></span></div>
-      </section>
+        <div class="row row-stack">
+          <label class="row-label" for="ctxTT">訳語の指定</label>
+          <textarea id="ctxTT" rows="3" spellcheck="false"
+            placeholder="1 行に「原語=訳語」&#10;例: Bedrock=Bedrock&#10;region=リージョン">${escapeText(settings.ctxTranslationTerms)}</textarea>
+        </div>
+        <div class="row row-stack">
+          <label class="row-label" for="ctxText">背景情報</label>
+          <textarea id="ctxText" rows="3" spellcheck="false"
+            placeholder="会議の議題、参加者、説明資料の要点など(任意)">${escapeText(settings.ctxText)}</textarea>
+        </div>
+      </div>
+      <p class="section-foot">「話される言語」を指定すると、その言語の認識が良くなります(他の言語も認識されます)。用語には人名・製品名・専門用語など普通の辞書にない語を書きます。訳語の指定で、名前を訳さずそのまま残すには「Kiro=Kiro」のように同じ語を書きます。文脈は合計で約 9,000 文字までです。</p>
 
-      <footer>Double-tap the glasses temple to exit.</footer>
-    </main>
+      <h2 class="section-title">メガネの表示</h2>
+      <div class="group">
+        ${selectRow('mode', '表示モード', DISPLAY_MODES.map(m => opt(m, MODE_LABEL[m], settings.displayMode)).join(''))}
+        ${switchRow('split', '文ごとに改行', settings.splitSentences)}
+        ${selectRow('align', '文字の配置', opt('left', '左寄せ', settings.align) + opt('center', '中央', settings.align))}
+        ${selectRow('valign', '表示の基準', opt('bottom', '下から', settings.vAlign) + opt('top', '上から', settings.vAlign))}
+        ${selectRow('linegap', '行間', opt(0, '標準', settings.lineGap) + opt(1, 'やや広め', settings.lineGap) + opt(2, '広め', settings.lineGap))}
+        ${selectRow('width', '表示幅', opt(100, '全幅', settings.widthPct) + opt(85, '広め', settings.widthPct) + opt(70, '中', settings.widthPct) + opt(55, '狭め', settings.widthPct))}
+        ${selectRow('maxlines', '最大行数', [0, 1, 2, 3, 4, 5, 6, 8].map(n => opt(n, n === 0 ? '自動' : `${n} 行`, settings.maxLines)).join(''))}
+      </div>
+
+      <h2 class="section-title">スマートフォンの表示</h2>
+      <div class="group">
+        ${switchRow('speakers', '話者を識別', settings.speakerLabels, '「話者1」などのラベルはスマートフォンにだけ表示し、メガネには表示しません')}
+      </div>
+
+      <p class="section-foot">表示モードはスマートフォンの画面にも反映されます。対訳は、原文の次の行に「→」付きで翻訳を表示します。</p>
+
+      <button id="save" type="button" class="primary">保存</button>
+      <p id="saved" class="saved" role="status"></p>
+    </div>
+
+    <div id="view-history" class="view" hidden>
+      <header class="bar">
+        <button id="closeHistory" type="button" class="bar-btn">‹ 戻る</button>
+        <h1>履歴</h1>
+        <span class="bar-spacer"></span>
+      </header>
+      <p class="section-foot">会話は対訳の形でこのスマートフォンのアプリ内に自動保存されます(最新 50 件)。「コピー」で全文をクリップボードにコピーし、メモなどのアプリに貼り付けて保存できます。</p>
+      <div id="history-list" class="history-list"></div>
+      <button id="deleteAll" type="button" class="danger" hidden>すべて削除</button>
+    </div>
   `
 
-  statusEl = app.querySelector<HTMLDivElement>('#status')!
-  txFinalEl = app.querySelector<HTMLSpanElement>('#tx-final')!
-  txInterimEl = app.querySelector<HTMLSpanElement>('#tx-interim')!
-  tlFinalEl = app.querySelector<HTMLSpanElement>('#tl-final')!
-  tlInterimEl = app.querySelector<HTMLSpanElement>('#tl-interim')!
-  tlLabelEl = app.querySelector<HTMLDivElement>('#tl-label')!
-  secondaryEl = app.querySelector<HTMLElement>('.pane-secondary')!
-
   const $ = <T extends HTMLElement>(sel: string) => app.querySelector<T>(sel)!
-  const apiKeyEl = $<HTMLInputElement>('#apiKey')
-  const langEl = $<HTMLSelectElement>('#lang')
-  const notranslateEl = $<HTMLInputElement>('#notranslate')
-  const alignEl = $<HTMLSelectElement>('#align')
-  const valignEl = $<HTMLSelectElement>('#valign')
-  const linegapEl = $<HTMLSelectElement>('#linegap')
-  const widthEl = $<HTMLSelectElement>('#width')
-  const maxlinesEl = $<HTMLSelectElement>('#maxlines')
-  const showtxEl = $<HTMLInputElement>('#showtx')
-  const splitEl = $<HTMLInputElement>('#split')
-  const speakersEl = $<HTMLInputElement>('#speakers')
-  const savedEl = $<HTMLSpanElement>('#saved')
-  const detailsEl = $<HTMLDetailsElement>('#settings')
+  statusEl = $('#status')
+  statusTextEl = $('#status-text')
+  txBodyEl = $('#tx-body')
+  tlBodyEl = $('#tl-body')
+  tlLabelEl = $('#tl-label')
+  secondaryEl = $('#pane-secondary')
+  primaryEl = $('#pane-primary')
+  pairedEl = $('#pane-paired')
+  pairedBodyEl = $('#paired-body')
 
-  // Show/hide the API key.
+  const views = { main: $('#view-main'), settings: $('#view-settings'), history: $('#view-history') }
+  const show = (name: keyof typeof views) => {
+    for (const [k, el] of Object.entries(views)) el.hidden = k !== name
+    window.scrollTo(0, 0)
+  }
+  const showSettings = (on: boolean) => show(on ? 'settings' : 'main')
+  $('#openSettings').addEventListener('click', () => showSettings(true))
+  $('#closeSettings').addEventListener('click', () => showSettings(false))
+  $('#openHistory').addEventListener('click', () => {
+    show('history')
+    void renderHistory(history, $('#history-list'), $<HTMLButtonElement>('#deleteAll'))
+  })
+  $('#closeHistory').addEventListener('click', () => show('main'))
+  const deleteAllEl = $<HTMLButtonElement>('#deleteAll')
+  deleteAllEl.addEventListener('click', () =>
+    confirmTap(deleteAllEl, 'もう一度押すとすべて削除', async () => {
+      await history.removeAll()
+      void renderHistory(history, $('#history-list'), deleteAllEl)
+    }),
+  )
+
+  const copyPairedEl = $<HTMLButtonElement>('#copyPaired')
+  copyPairedEl.addEventListener('click', () =>
+    copyToClipboard(pairedExportText(pairedFull, '', formatSpeaker).trim(), copyPairedEl),
+  )
+
+  const apiKeyEl = $<HTMLInputElement>('#apiKey')
   const revealEl = $<HTMLButtonElement>('#revealKey')
   revealEl.addEventListener('click', () => {
     const show = apiKeyEl.type === 'password'
     apiKeyEl.type = show ? 'text' : 'password'
-    revealEl.textContent = show ? 'Hide' : 'Show'
+    revealEl.textContent = show ? '隠す' : '表示'
   })
 
-  // Copy the current translation text.
   const copyEl = $<HTMLButtonElement>('#copyTl')
-  copyEl.addEventListener('click', () => {
-    const text = (tlFinalEl.textContent ?? '') + (tlInterimEl.textContent ?? '')
-    copyToClipboard(text.trim(), copyEl)
-  })
+  copyEl.addEventListener('click', () => copyToClipboard(tlFull.trim(), copyEl))
 
-  $<HTMLButtonElement>('#save').addEventListener('click', () => {
+  const savedEl = $('#saved')
+  $('#save').addEventListener('click', () => {
+    const val = (id: string) => $<HTMLSelectElement | HTMLInputElement>('#' + id).value
+    const on = (id: string) => $<HTMLInputElement>('#' + id).checked
     const next: AppSettings = {
       apiKey: apiKeyEl.value.trim(),
-      targetLang: langEl.value,
-      showTranscript: showtxEl.checked,
-      noTranslateLangs: parseCodes(notranslateEl.value),
-      splitSentences: splitEl.checked,
-      speakerLabels: speakersEl.checked,
-      align: alignEl.value === 'center' ? 'center' : 'left',
-      vAlign: valignEl.value === 'top' ? 'top' : 'bottom',
-      lineGap: parseInt(linegapEl.value, 10) || 0,
-      widthPct: parseInt(widthEl.value, 10) || 100,
-      maxLines: parseInt(maxlinesEl.value, 10) || 0,
+      targetLang: val('lang'),
+      displayMode: (DISPLAY_MODES as string[]).includes(val('mode')) ? (val('mode') as DisplayMode) : 'split',
+      noTranslateLangs: parseCodes(val('notranslate')),
+      languageHints: parseCodes(val('hints')),
+      ctxTopic: val('ctxTopic').trim(),
+      ctxTerms: val('ctxTerms').trim(),
+      ctxTranslationTerms: val('ctxTT').trim(),
+      ctxText: val('ctxText').trim(),
+      splitSentences: on('split'),
+      speakerLabels: on('speakers'),
+      align: val('align') === 'center' ? 'center' : 'left',
+      vAlign: val('valign') === 'top' ? 'top' : 'bottom',
+      lineGap: parseInt(val('linegap'), 10) || 0,
+      widthPct: parseInt(val('width'), 10) || 100,
+      maxLines: parseInt(val('maxlines'), 10) || 0,
     }
     setTargetLangLabel(next.targetLang)
-    setSecondaryVisible(next.showTranscript)
-    savedEl.textContent = 'Saved ✓'
-    setTimeout(() => (savedEl.textContent = ''), 2000)
-    if (next.apiKey) detailsEl.open = false
+    applyMode(next.displayMode)
+    savedEl.textContent = next.apiKey ? '保存しました' : '保存しました(API キーが未入力です)'
+    setTimeout(() => (savedEl.textContent = ''), 2500)
     onSave(next)
+    if (next.apiKey) showSettings(false)
   })
 
-  setSecondaryVisible(settings.showTranscript)
+  setTargetLangLabel(settings.targetLang)
+  applyMode(settings.displayMode)
+  showSettings(!settings.apiKey)
   injectStyles()
 }
 
 export function setStatus(kind: Status, text: string) {
   if (!statusEl) return
   statusEl.className = `status status-${kind}`
-  statusEl.textContent = STATUS_LABEL[kind]
+  statusTextEl.textContent =
+    kind === 'connecting' ? STATUS_LABEL[kind] : kind === 'error' || kind === 'setup' ? `${STATUS_LABEL[kind]}: ${text}` : `${STATUS_LABEL[kind]}(${text})`
   statusEl.title = text
 }
 
 export function setTranscript(finalText: string, interimText: string) {
-  if (!txFinalEl) return
-  txFinalEl.textContent = finalText
-  txInterimEl.textContent = interimText
+  if (txBodyEl) renderPane(txBodyEl, finalText, interimText)
 }
 
 export function setTranslation(finalText: string, interimText: string) {
-  if (!tlFinalEl) return
-  tlFinalEl.textContent = finalText
-  tlInterimEl.textContent = interimText
+  tlFull = finalText + interimText
+  if (tlBodyEl) renderPane(tlBodyEl, finalText, interimText)
 }
 
 export function setTargetLangLabel(code: string) {
   if (!tlLabelEl) return
-  tlLabelEl.textContent = code ? `Translation · ${langName(code)}` : 'Transcript'
+  tlLabelEl.textContent = code ? `翻訳(${langName(code)})` : '文字起こし'
 }
 
-function setSecondaryVisible(visible: boolean) {
-  if (secondaryEl) secondaryEl.style.display = visible ? '' : 'none'
+// Phone layout follows the glasses display mode.
+function applyMode(mode: DisplayMode) {
+  if (!secondaryEl) return
+  const paired = mode === 'paired'
+  pairedEl.hidden = !paired
+  primaryEl.hidden = paired
+  secondaryEl.hidden = paired || !hasOriginalPane(mode)
+  secondaryEl.classList.toggle('card-37', mode === 'split37')
+  if (paired) setPaired(pairedFull)
+}
+
+/** Bilingual Paired phone view: original (dim) then translation, per utterance. */
+export function setPaired(vm: PairView[]) {
+  pairedFull = vm
+  if (!pairedBodyEl || pairedEl.hidden) return
+  const el = pairedBodyEl
+  const stick = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  const frag = document.createDocumentFragment()
+  for (const p of vm.slice(-200)) {
+    const orig = p.orig + p.origInterim
+    const trans = p.trans + p.transInterim
+    if (!orig.trim() && !trans.trim()) continue
+    const item = document.createElement('div')
+    item.className = 'pair'
+    // First line: [time] [speaker] original (or the text itself when same-language).
+    const head = document.createElement('div')
+    const hasOrig = !p.same && !!orig.trim()
+    head.className = hasOrig ? 'pair-orig' : 'pair-trans pair-same'
+    if (p.at) {
+      const time = document.createElement('span')
+      time.className = 'pair-time'
+      time.textContent = fmtClock(p.at)
+      head.append(time)
+    }
+    if (p.speaker !== undefined) {
+      const chip = document.createElement('span')
+      chip.className = 'speaker'
+      chip.textContent = formatSpeaker(p.speaker).replace(/[:\s]+$/, '')
+      head.append(chip)
+    }
+    if (hasOrig) {
+      head.append(p.orig.trimStart())
+      if (p.origInterim) head.append(interimSpan(p.origInterim))
+    } else {
+      head.append(p.trans.trimStart())
+      if (p.transInterim) head.append(interimSpan(p.transInterim))
+    }
+    item.append(head)
+    if (hasOrig && trans.trim()) {
+      const t = document.createElement('div')
+      t.className = 'pair-trans'
+      t.append(p.trans)
+      if (p.transInterim) t.append(interimSpan(p.transInterim))
+      item.append(t)
+    }
+    frag.append(item)
+  }
+  el.replaceChildren(frag)
+  if (stick) el.scrollTop = el.scrollHeight
+}
+
+function interimSpan(text: string) {
+  const s = document.createElement('span')
+  s.className = 'interim'
+  s.textContent = text
+  return s
+}
+
+// ── History screen ───────────────────────────────────────────────────────────
+async function renderHistory(h: HistoryHandlers, listEl: HTMLElement, deleteAllEl: HTMLButtonElement) {
+  listEl.textContent = '読み込み中…'
+  const items = await h.list()
+  deleteAllEl.hidden = items.length === 0
+  if (!items.length) {
+    listEl.innerHTML = '<p class="empty">まだ保存された会話はありません。</p>'
+    return
+  }
+  const cur = h.currentId()
+  const frag = document.createDocumentFragment()
+  for (const m of items) {
+    const row = document.createElement('div')
+    row.className = 'group history-item'
+    const head = document.createElement('div')
+    head.className = 'history-head'
+    head.textContent = `${fmtDateTime(m.start)}〜${fmtTime(m.end)}・${m.targetLang ? langName(m.targetLang) : '文字起こし'}・${m.count} 件`
+    if (m.id === cur) {
+      const live = document.createElement('span')
+      live.className = 'live-tag'
+      live.textContent = '記録中'
+      head.append(live)
+    }
+    const pv = document.createElement('div')
+    pv.className = 'history-preview'
+    pv.textContent = m.preview
+    const actions = document.createElement('div')
+    actions.className = 'history-actions'
+    const copyBtn = button('コピー', async () => {
+      const rec = await h.get(m.id)
+      if (rec) await copyToClipboard(exportText(rec, formatSpeaker), copyBtn)
+    })
+    actions.append(copyBtn)
+    if (m.id !== cur) {
+      const delBtn: HTMLButtonElement = button(
+        '削除',
+        () =>
+          confirmTap(delBtn, 'もう一度押すと削除', async () => {
+            await h.remove(m.id)
+            row.remove()
+          }),
+        'text-btn danger-text',
+      )
+      actions.append(delBtn)
+    }
+    row.append(head, pv, actions)
+    frag.append(row)
+  }
+  listEl.replaceChildren(frag)
+}
+
+// Two-tap confirmation (window.confirm may be unavailable in the host WebView).
+const armed = new WeakMap<HTMLButtonElement, { label: string; timer: number }>()
+async function confirmTap(btn: HTMLButtonElement, prompt: string, action: () => Promise<void>) {
+  const a = armed.get(btn)
+  if (a) {
+    clearTimeout(a.timer)
+    armed.delete(btn)
+    btn.textContent = a.label
+    await action()
+    return
+  }
+  const label = btn.textContent ?? ''
+  btn.textContent = prompt
+  armed.set(btn, {
+    label,
+    timer: window.setTimeout(() => {
+      armed.delete(btn)
+      btn.textContent = label
+    }, 3000),
+  })
+}
+
+function button(label: string, onClick: () => void | Promise<void>, cls = 'text-btn') {
+  const b = document.createElement('button')
+  b.type = 'button'
+  b.className = cls
+  b.textContent = label
+  b.addEventListener('click', () => void onClick())
+  return b
+}
+
+
+
+// Render text into a pane: "話者N: " line prefixes become label chips, the
+// interim (not yet final) tail is dimmed, and the pane sticks to the bottom.
+function renderPane(el: HTMLElement, finalText: string, interimText: string) {
+  const stick = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  let text = finalText
+  if (text.length > PHONE_TAIL) {
+    text = text.slice(-PHONE_TAIL)
+    const nl = text.indexOf('\n')
+    if (nl >= 0) text = text.slice(nl + 1)
+  }
+  const frag = document.createDocumentFragment()
+  text.split('\n').forEach((line, i) => {
+    if (i > 0) frag.append('\n')
+    const m = SPEAKER_RE.exec(line)
+    if (m) {
+      const chip = document.createElement('span')
+      chip.className = 'speaker'
+      chip.textContent = m[1]
+      frag.append(chip, line.slice(m[0].length))
+    } else {
+      frag.append(line)
+    }
+  })
+  if (interimText) {
+    const s = document.createElement('span')
+    s.className = 'interim'
+    s.textContent = interimText
+    frag.append(s)
+  }
+  el.replaceChildren(frag)
+  if (stick) el.scrollTop = el.scrollHeight
 }
 
 function parseCodes(s: string): string[] {
   return s
-    .split(/[\s,]+/)
+    .split(/[\s,、]+/)
     .map(x => x.trim().toLowerCase())
     .filter(Boolean)
 }
@@ -225,10 +508,10 @@ async function copyToClipboard(text: string, btn: HTMLButtonElement) {
     btn.textContent = msg
     setTimeout(() => (btn.textContent = prev), 1500)
   }
-  if (!text) return flash('Nothing yet')
+  if (!text) return flash('まだありません')
   try {
     await navigator.clipboard.writeText(text)
-    return flash('Copied ✓')
+    return flash('コピーしました')
   } catch {
     try {
       const ta = document.createElement('textarea')
@@ -239,11 +522,15 @@ async function copyToClipboard(text: string, btn: HTMLButtonElement) {
       ta.select()
       document.execCommand('copy')
       ta.remove()
-      return flash('Copied ✓')
+      return flash('コピーしました')
     } catch {
-      return flash('Copy failed')
+      return flash('コピー失敗')
     }
   }
+}
+
+function escapeText(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
 function escapeAttr(s: string): string {
@@ -252,68 +539,127 @@ function escapeAttr(s: string): string {
 
 function injectStyles() {
   const css = `
-    :root { color-scheme: dark; }
-    html, body { margin: 0; background: #1c1c1c; color: #E5E5E5;
-      font: 16px/1.4 -apple-system, BlinkMacSystemFont, 'Helvetica Neue', system-ui, sans-serif;
-      -webkit-text-size-adjust: 100%; }
-    /* min-height (not height) so the page grows with the open settings form and
-       the body scrolls — otherwise the Save button is unreachable. */
-    #app { min-height: 100vh; }
-    .panel { display: flex; flex-direction: column; gap: 12px; min-height: 100vh;
-      width: 100%; max-width: 640px; margin: 0 auto; padding: 20px; box-sizing: border-box; }
-    header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    h1 { font-size: 18px; font-weight: 600; margin: 0; letter-spacing: 0.02em; }
-    .status { font-size: 12px; padding: 4px 10px; border-radius: 999px; white-space: nowrap;
-      border: 1px solid transparent; letter-spacing: 0.04em; text-transform: uppercase; }
-    .status::before { content: '●'; margin-right: 5px; font-size: 9px; vertical-align: 1px; }
-    .status-connecting { color: #A7A7A7; border-color: #3E3E3E; }
-    .status-listening  { color: #3CFA44; border-color: #3CFA44; background: rgba(60,250,68,0.08); }
-    .status-reconnecting { color: #FEB340; border-color: #FEB340; background: rgba(254,179,64,0.10); }
-    .status-setup      { color: #FEF991; border-color: #FEF991; background: rgba(254,249,145,0.08); }
-    .status-error      { color: #FF453A; border-color: #FF453A; background: rgba(255,69,58,0.08); }
+    :root {
+      /* One knob for all text sizes (the old UI used 11-18px; this is ~2x). */
+      --base: 24px;
+      /* Settings screen text relative to --base (0.7 = 70%). */
+      --settings-scale: 0.7em;
+      /* Caption (main) screen text relative to --base (0.7 = 70%). */
+      --main-scale: 0.7em;
+      color-scheme: light dark;
+      --bg: #f2f2f7; --card: #ffffff; --text: #1c1c1e; --sub: #6c6c70; --sep: #d1d1d6;
+      --accent: #007aff; --ok: #34c759; --warn: #ff9500; --err: #ff3b30; --interim: #8e8e93;
+      --chip-bg: rgba(0,122,255,0.12);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #000000; --card: #1c1c1e; --text: #ffffff; --sub: #98989f; --sep: #38383a;
+        --accent: #0a84ff; --ok: #30d158; --warn: #ff9f0a; --err: #ff453a; --interim: #8d8d93;
+        --chip-bg: rgba(10,132,255,0.22); }
+    }
+    html { font-size: var(--base); }
+    html, body { margin: 0; background: var(--bg); color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Noto Sans JP', system-ui, sans-serif;
+      line-height: 1.5; -webkit-text-size-adjust: 100%; }
+    [hidden] { display: none !important; }
+    /* Sizes below are in em, so each screen can be scaled on its own. */
+    #view-settings { font-size: var(--settings-scale); }
+    #view-main { font-size: var(--main-scale); }
+    .view { max-width: 720px; margin: 0 auto; padding: 0 0.75em 1.5em; box-sizing: border-box;
+      display: flex; flex-direction: column; gap: 0.6em; min-height: 100vh; }
 
-    .settings { background: #2A2A2A; border: 1px solid #3A3A3A; border-radius: 14px; padding: 14px 16px; }
-    .settings summary { cursor: pointer; font-size: 13px; letter-spacing: 0.04em;
-      text-transform: uppercase; color: #A7A7A7; user-select: none; }
-    .settings[open] summary { margin-bottom: 14px; }
-    .group-title { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #6E6E6E;
-      margin: 6px 0 10px; padding-bottom: 6px; border-bottom: 1px solid #343434; }
-    .group-title + * { margin-top: 0; }
-    .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
-    .field label { font-size: 12px; color: #A7A7A7; }
-    .field input, .field select { background: rgba(255,255,255,0.06); color: #E5E5E5;
-      border: 1px solid #3E3E3E; border-radius: 9px; padding: 11px 12px; font-size: 16px; width: 100%; box-sizing: border-box; }
-    .key-wrap { display: flex; gap: 8px; align-items: stretch; }
-    .key-wrap input { flex: 1; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
-    .row .field { flex: 1 1 140px; min-width: 0; margin-bottom: 0; }
-    .hint { margin: 0; font-size: 12px; color: #7B7B7B; }
-    .hint a { color: #FEF991; }
-    .dim { color: #7B7B7B; }
-    .check { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #C9C9C9; margin-bottom: 10px; }
-    .check input { width: 18px; height: 18px; }
-    .actions { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
-    .primary { background: #FEF991; color: #232323; border: 0; border-radius: 9px;
-      padding: 11px 20px; font-size: 15px; font-weight: 600; cursor: pointer; }
-    .ghost { background: transparent; color: #A7A7A7; border: 1px solid #3E3E3E; border-radius: 8px;
-      padding: 8px 12px; font-size: 13px; cursor: pointer; white-space: nowrap; }
-    .ghost:active { background: rgba(255,255,255,0.06); }
-    .saved { font-size: 13px; color: #3CFA44; }
+    .bar { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between;
+      gap: 0.5em; padding: 0.6em 0; background: var(--bg); }
+    .bar h1 { font-size: 1.25em; font-weight: 700; margin: 0; }
+    .bar-btn { background: none; border: 0; color: var(--accent); font: inherit; font-size: 1em;
+      padding: 0.3em 0; cursor: pointer; min-height: 2em; }
+    .bar-spacer { width: 3.5em; }
 
-    .pane { flex: 1; display: flex; flex-direction: column; gap: 8px;
-      background: #2A2A2A; border: 1px solid #3A3A3A; border-radius: 14px;
-      padding: 14px 18px; min-height: 110px; }
-    .pane-translation { border-color: rgba(60,250,68,0.22); }
-    .pane-primary { flex: 2.5; }
-    .pane-secondary { flex: 1; opacity: 0.85; }
-    .pane-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    .pane-label { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: #7B7B7B; }
-    .pane-translation .pane-label { color: #3CFA44; }
-    .pane-body { flex: 1; overflow: auto; color: #E5E5E5;
-      font-size: 18px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
-    .pane-secondary .pane-body { font-size: 15px; color: #B5B5B5; }
-    .interim { color: #8E8E8E; }
-    footer { font-size: 12px; color: #7B7B7B; text-align: center; }
+    .status { display: flex; align-items: center; gap: 0.4em; font-size: 0.9em; color: var(--sub); }
+    .status .dot { width: 0.55em; height: 0.55em; border-radius: 50%; background: var(--sub); flex: none; }
+    .status-listening .dot { background: var(--ok); }
+    .status-listening { color: var(--ok); }
+    .status-reconnecting .dot { background: var(--warn); } .status-reconnecting { color: var(--warn); }
+    .status-setup .dot { background: var(--warn); } .status-setup { color: var(--warn); }
+    .status-error .dot { background: var(--err); } .status-error { color: var(--err); }
+
+    .card { background: var(--card); border-radius: 0.6em; padding: 0.6em 0.75em;
+      display: flex; flex-direction: column; gap: 0.3em; min-height: 4.5em; }
+    .card-primary { flex: 2.5; }
+    .card-secondary { flex: 1; }
+    .card-head { display: flex; align-items: center; justify-content: space-between; }
+    .card-title { font-size: 0.9em; font-weight: 600; color: var(--sub); }
+    .card-body { flex: 1; overflow: auto; max-height: 60vh; white-space: pre-wrap; word-break: break-word;
+      font-size: 1.15em; line-height: 1.6; }
+    .card-secondary .card-body { font-size: 1em; color: var(--sub); max-height: 30vh; }
+    .interim { color: var(--interim); }
+    .speaker { display: inline-block; font-size: 0.7em; font-weight: 600; color: var(--accent);
+      background: var(--chip-bg); border-radius: 0.4em; padding: 0 0.35em; margin-right: 0.35em;
+      vertical-align: 0.1em; line-height: 1.5; }
+    .footnote { font-size: 0.85em; color: var(--sub); text-align: center; margin: 0.3em 0 0; }
+
+    .section-title { font-size: 0.85em; font-weight: 400; color: var(--sub); margin: 0.9em 0.6em 0.1em; }
+    .section-foot { font-size: 0.85em; color: var(--sub); margin: 0.1em 0.6em 0; }
+    .section-foot a { color: var(--accent); }
+    .group { background: var(--card); border-radius: 0.6em; overflow: hidden; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 0.75em;
+      min-height: 2.4em; padding: 0.45em 0.75em; box-sizing: border-box; border-top: 1px solid var(--sep); }
+    .group > .row:first-child { border-top: 0; }
+    .row-stack { flex-direction: column; align-items: stretch; gap: 0.35em; }
+    .row-text { display: flex; flex-direction: column; gap: 0.1em; min-width: 0; }
+    .row-label { font-size: 1em; }
+    .row-sub { font-size: 0.8em; color: var(--sub); }
+    .row-select { -webkit-appearance: none; appearance: none; font: inherit; font-size: 1em; color: var(--sub);
+      background: transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='16' viewBox='0 0 10 16'%3E%3Cpath d='M2 2l6 6-6 6' fill='none' stroke='%238e8e93' stroke-width='2'/%3E%3C/svg%3E") no-repeat right center / 0.4em auto;
+      border: 0; text-align: right; text-align-last: right; padding: 0.2em 0.75em 0.2em 0; max-width: 60%; cursor: pointer; }
+    .row-select option { color: initial; }
+    .row textarea { resize: vertical; line-height: 1.4; }
+    .row input[type=text], .row input[type=password], .row textarea { font: inherit; font-size: 1em; color: var(--text);
+      background: var(--bg); border: 1px solid var(--sep); border-radius: 0.4em; padding: 0.35em 0.5em;
+      width: 100%; box-sizing: border-box; min-width: 0; }
+    .key-wrap { display: flex; gap: 0.5em; align-items: center; }
+    .text-btn { background: none; border: 0; color: var(--accent); font: inherit; font-size: 0.9em;
+      padding: 0.2em 0.3em; cursor: pointer; white-space: nowrap; }
+
+    /* iOS-style toggle switch on a checkbox */
+    .switch { appearance: none; -webkit-appearance: none; flex: none; position: relative; margin: 0;
+      width: 2.15em; height: 1.3em; border-radius: 1em; background: var(--sep); cursor: pointer;
+      transition: background 0.2s; }
+    .switch::after { content: ''; position: absolute; top: 0.1em; left: 0.1em; width: 1.1em; height: 1.1em;
+      border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.3); transition: transform 0.2s; }
+    .switch:checked { background: var(--ok); }
+    .switch:checked::after { transform: translateX(0.85em); }
+    @media (prefers-reduced-motion: reduce) { .switch, .switch::after { transition: none; } }
+
+    .primary { margin-top: 1em; width: 100%; min-height: 2.3em; border: 0; border-radius: 0.6em;
+      background: var(--accent); color: #fff; font: inherit; font-size: 1em; font-weight: 600; cursor: pointer; }
+    .primary:active { opacity: 0.8; }
+    .saved { min-height: 1.4em; font-size: 0.9em; color: var(--ok); text-align: center; margin: 0.3em 0 0; }
+
+    .bar-actions { display: flex; gap: 0.9em; }
+    /* split37: original pane 3 : translation 7 */
+    .card-secondary.card-37 { flex: 1.07; }
+
+    /* Bilingual Paired */
+    .card-body.paired { white-space: normal; display: flex; flex-direction: column; gap: 0; }
+    .pair-orig { color: var(--sub); font-size: 0.85em; white-space: pre-wrap; }
+    .pair-trans { white-space: pre-wrap; }
+    .pair-trans:not(.pair-same)::before { content: '→ '; color: var(--sub); }
+    .pair-time { font-size: 0.75em; color: var(--sub); font-variant-numeric: tabular-nums; margin-right: 0.4em; }
+    .pair .speaker { font-size: 0.75em; }
+
+    /* History */
+    .history-list { display: flex; flex-direction: column; gap: 0.6em; margin-top: 0.4em; }
+    .history-item { padding: 0.6em 0.75em; display: flex; flex-direction: column; gap: 0.25em; }
+    .history-head { font-size: 0.85em; color: var(--sub); display: flex; align-items: center; gap: 0.5em; flex-wrap: wrap; }
+    .history-preview { font-size: 1em; }
+    .history-actions { display: flex; gap: 1em; margin-top: 0.2em; }
+    .history-actions .text-btn { padding-left: 0; }
+    .live-tag { font-size: 0.8em; color: #fff; background: var(--ok); border-radius: 0.4em; padding: 0 0.4em; }
+    .danger-text { color: var(--err) !important; }
+    .danger { margin-top: 1em; width: 100%; min-height: 2.3em; border: 0; border-radius: 0.6em;
+      background: var(--card); color: var(--err); font: inherit; font-size: 1em; cursor: pointer; }
+    .empty { color: var(--sub); text-align: center; margin: 2em 0; }
+    #view-history { font-size: var(--settings-scale); }
   `
   const style = document.createElement('style')
   style.textContent = css
