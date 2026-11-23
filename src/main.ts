@@ -17,7 +17,7 @@ const PH_TRANSLATE = '翻訳を待っています…'
 const PH_PAUSED = '一時停止中'
 const PH_PAUSED_START = '一時停止中です。\nタップすると聞き取りを開始します。'
 const PH_PAUSED_FOOTER = '- 一時停止中(タップで再開) -'
-import { type AppSettings, type DisplayMode, DISPLAY_MODES, SETTINGS_KEY, mergeSettings, hasOriginalPane } from './settings'
+import { type AppSettings, type DisplayMode, DISPLAY_MODES, SETTINGS_KEY, mergeSettings, hasOriginalPane, buildContext } from './settings'
 import { type Pair, PAIR_LINE, withInterim, pairedGlassesText } from './paired'
 import { History, type SessionRecord } from './history'
 
@@ -410,6 +410,8 @@ function startStream() {
         splitSentences: settings.splitSentences,
         speakerLabels: settings.speakerLabels,
         noTranslateLangs: settings.noTranslateLangs,
+        languageHints: settings.languageHints,
+        context: buildContext(settings),
         formatSpeaker,
       },
       onSnap,
@@ -489,7 +491,9 @@ async function handleSave(next: AppSettings) {
     next.targetLang !== prev.targetLang ||
     next.splitSentences !== prev.splitSentences ||
     next.speakerLabels !== prev.speakerLabels ||
-    next.noTranslateLangs.join(',') !== prev.noTranslateLangs.join(',')
+    next.noTranslateLangs.join(',') !== prev.noTranslateLangs.join(',') ||
+    next.languageHints.join(',') !== prev.languageHints.join(',') ||
+    JSON.stringify(buildContext(next)) !== JSON.stringify(buildContext(prev))
 
   if (needRestart) {
     rawTx = ''

@@ -6,6 +6,8 @@
 export interface Pair {
   /** Speaker index in order of appearance (only with speaker labels on). */
   speaker?: number
+  /** When the utterance started (ms since epoch). */
+  at?: number
   orig: string
   trans: string
   same: boolean
@@ -67,25 +69,30 @@ export function pairedGlassesText(vm: PairView[]): string {
   return out.join('\n')
 }
 
-/** Plain-text export (Bilingual Paired). */
+const pad2 = (n: number) => String(n).padStart(2, '0')
+/** HH:MM:SS (local time). */
+export function fmtClock(ms: number): string {
+  const d = new Date(ms)
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`
+}
+
+/** Text lines of one pair: "[HH:MM:SS] [話者N] original" then "→ translation". */
+export function pairLines(p: Pair & Partial<PairView>, formatSpeaker?: (i: number) => string): string[] {
+  const orig = (p.orig + (p.origInterim ?? '')).replace(/\s*\n\s*/g, ' ').trim()
+  const trans = (p.trans + (p.transInterim ?? '')).replace(/\s*\n\s*/g, ' ').trim()
+  if (!orig && !trans) return []
+  const time = p.at ? `[${fmtClock(p.at)}] ` : ''
+  const spk = p.speaker !== undefined && formatSpeaker ? `[${formatSpeaker(p.speaker).replace(/[:\s]+$/, '')}] ` : ''
+  if (p.same || !orig) return [time + spk + trans]
+  return trans ? [time + spk + orig, TRANS_MARK + trans] : [time + spk + orig]
+}
+
+/** Plain-text export (Bilingual Paired): header, blank line, then pairs with no gaps. */
 export function pairedExportText(
-  pairs: Pair[],
+  pairs: (Pair & Partial<PairView>)[],
   header: string,
   formatSpeaker?: (i: number) => string,
 ): string {
-  const lines: string[] = [header, '']
-  for (const p of pairs) {
-    const orig = p.orig.replace(/\s*\n\s*/g, ' ').trim()
-    const trans = p.trans.replace(/\s*\n\s*/g, ' ').trim()
-    if (!orig && !trans) continue
-    const spk = p.speaker !== undefined && formatSpeaker ? `[${formatSpeaker(p.speaker).replace(/[:\s]+$/, '')}] ` : ''
-    if (p.same || !orig) {
-      lines.push(spk + trans)
-    } else {
-      lines.push(spk + orig)
-      if (trans) lines.push(TRANS_MARK + trans)
-    }
-    lines.push('')
-  }
-  return lines.join('\n').trimEnd() + '\n'
+  const lines = pairs.flatMap(p => pairLines(p, formatSpeaker))
+  return (header ? [header, '', ...lines] : lines).join('\n') + '\n'
 }

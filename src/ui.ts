@@ -5,7 +5,7 @@
 // --settings-scale shrink/grow the caption and settings screens relative to it.
 import { LANGUAGES, langName } from './languages'
 import { type AppSettings, type DisplayMode, DISPLAY_MODES, hasOriginalPane } from './settings'
-import type { PairView } from './paired'
+import { type PairView, fmtClock, pairedExportText } from './paired'
 import { type SessionMeta, type SessionRecord, exportText, fmtDateTime, fmtTime } from './history'
 
 const MODE_LABEL: Record<DisplayMode, string> = {
@@ -140,6 +140,36 @@ export function mountUi({ settings, onSave, history }: UiHandlers) {
       </div>
       <p class="section-foot">言語コードをカンマ区切りで入力します。翻訳先と同じ言語の発話は、翻訳せずそのまま 1 回だけ表示します。</p>
 
+      <h2 class="section-title">認識の精度(言語ヒント・文脈)</h2>
+      <div class="group">
+        <div class="row row-stack">
+          <label class="row-label" for="hints">話される言語</label>
+          <input id="hints" type="text" autocapitalize="off" spellcheck="false"
+            placeholder="例: ja, en" value="${escapeAttr(settings.languageHints.join(', '))}" />
+        </div>
+        <div class="row row-stack">
+          <label class="row-label" for="ctxTopic">話題・分野</label>
+          <input id="ctxTopic" type="text" spellcheck="false"
+            placeholder="例: AWS のクラウドサービスの商談" value="${escapeAttr(settings.ctxTopic)}" />
+        </div>
+        <div class="row row-stack">
+          <label class="row-label" for="ctxTerms">用語・固有名詞</label>
+          <textarea id="ctxTerms" rows="3" spellcheck="false"
+            placeholder="1 行に 1 つ(カンマ区切りも可)&#10;例: Amazon Bedrock&#10;Kiro">${escapeText(settings.ctxTerms)}</textarea>
+        </div>
+        <div class="row row-stack">
+          <label class="row-label" for="ctxTT">訳語の指定</label>
+          <textarea id="ctxTT" rows="3" spellcheck="false"
+            placeholder="1 行に「原語=訳語」&#10;例: Bedrock=Bedrock&#10;region=リージョン">${escapeText(settings.ctxTranslationTerms)}</textarea>
+        </div>
+        <div class="row row-stack">
+          <label class="row-label" for="ctxText">背景情報</label>
+          <textarea id="ctxText" rows="3" spellcheck="false"
+            placeholder="会議の議題、参加者、説明資料の要点など(任意)">${escapeText(settings.ctxText)}</textarea>
+        </div>
+      </div>
+      <p class="section-foot">「話される言語」を指定すると、その言語の認識が良くなります(他の言語も認識されます)。用語には人名・製品名・専門用語など普通の辞書にない語を書きます。訳語の指定で、名前を訳さずそのまま残すには「Kiro=Kiro」のように同じ語を書きます。文脈は合計で約 9,000 文字までです。</p>
+
       <h2 class="section-title">メガネの表示</h2>
       <div class="group">
         ${selectRow('mode', '表示モード', DISPLAY_MODES.map(m => opt(m, MODE_LABEL[m], settings.displayMode)).join(''))}
@@ -208,17 +238,7 @@ export function mountUi({ settings, onSave, history }: UiHandlers) {
 
   const copyPairedEl = $<HTMLButtonElement>('#copyPaired')
   copyPairedEl.addEventListener('click', () =>
-    copyToClipboard(
-      pairedFull
-        .map(p => {
-          const o = (p.orig + p.origInterim).trim()
-          const t = (p.trans + p.transInterim).trim()
-          return p.same || !o ? t : t ? `${o}\n→ ${t}` : o
-        })
-        .filter(Boolean)
-        .join('\n\n'),
-      copyPairedEl,
-    ),
+    copyToClipboard(pairedExportText(pairedFull, '', formatSpeaker).trim(), copyPairedEl),
   )
 
   const apiKeyEl = $<HTMLInputElement>('#apiKey')
@@ -241,6 +261,11 @@ export function mountUi({ settings, onSave, history }: UiHandlers) {
       targetLang: val('lang'),
       displayMode: (DISPLAY_MODES as string[]).includes(val('mode')) ? (val('mode') as DisplayMode) : 'split',
       noTranslateLangs: parseCodes(val('notranslate')),
+      languageHints: parseCodes(val('hints')),
+      ctxTopic: val('ctxTopic').trim(),
+      ctxTerms: val('ctxTerms').trim(),
+      ctxTranslationTerms: val('ctxTT').trim(),
+      ctxText: val('ctxText').trim(),
       splitSentences: on('split'),
       speakerLabels: on('speakers'),
       align: val('align') === 'center' ? 'center' : 'left',
@@ -309,22 +334,33 @@ export function setPaired(vm: PairView[]) {
     if (!orig.trim() && !trans.trim()) continue
     const item = document.createElement('div')
     item.className = 'pair'
+    // First line: [time] [speaker] original (or the text itself when same-language).
+    const head = document.createElement('div')
+    const hasOrig = !p.same && !!orig.trim()
+    head.className = hasOrig ? 'pair-orig' : 'pair-trans pair-same'
+    if (p.at) {
+      const time = document.createElement('span')
+      time.className = 'pair-time'
+      time.textContent = fmtClock(p.at)
+      head.append(time)
+    }
     if (p.speaker !== undefined) {
       const chip = document.createElement('span')
       chip.className = 'speaker'
       chip.textContent = formatSpeaker(p.speaker).replace(/[:\s]+$/, '')
-      item.append(chip)
+      head.append(chip)
     }
-    if (!p.same && orig.trim()) {
-      const o = document.createElement('div')
-      o.className = 'pair-orig'
-      o.append(p.orig)
-      if (p.origInterim) o.append(interimSpan(p.origInterim))
-      item.append(o)
+    if (hasOrig) {
+      head.append(p.orig.trimStart())
+      if (p.origInterim) head.append(interimSpan(p.origInterim))
+    } else {
+      head.append(p.trans.trimStart())
+      if (p.transInterim) head.append(interimSpan(p.transInterim))
     }
-    if (trans.trim()) {
+    item.append(head)
+    if (hasOrig && trans.trim()) {
       const t = document.createElement('div')
-      t.className = p.same ? 'pair-trans pair-same' : 'pair-trans'
+      t.className = 'pair-trans'
       t.append(p.trans)
       if (p.transInterim) t.append(interimSpan(p.transInterim))
       item.append(t)
@@ -493,6 +529,10 @@ async function copyToClipboard(text: string, btn: HTMLButtonElement) {
   }
 }
 
+function escapeText(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
 function escapeAttr(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')
 }
@@ -572,7 +612,8 @@ function injectStyles() {
       background: transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='16' viewBox='0 0 10 16'%3E%3Cpath d='M2 2l6 6-6 6' fill='none' stroke='%238e8e93' stroke-width='2'/%3E%3C/svg%3E") no-repeat right center / 0.4em auto;
       border: 0; text-align: right; text-align-last: right; padding: 0.2em 0.75em 0.2em 0; max-width: 60%; cursor: pointer; }
     .row-select option { color: initial; }
-    .row input[type=text], .row input[type=password] { font: inherit; font-size: 1em; color: var(--text);
+    .row textarea { resize: vertical; line-height: 1.4; }
+    .row input[type=text], .row input[type=password], .row textarea { font: inherit; font-size: 1em; color: var(--text);
       background: var(--bg); border: 1px solid var(--sep); border-radius: 0.4em; padding: 0.35em 0.5em;
       width: 100%; box-sizing: border-box; min-width: 0; }
     .key-wrap { display: flex; gap: 0.5em; align-items: center; }
@@ -599,11 +640,12 @@ function injectStyles() {
     .card-secondary.card-37 { flex: 1.07; }
 
     /* Bilingual Paired */
-    .card-body.paired { white-space: normal; display: flex; flex-direction: column; gap: 0.7em; }
+    .card-body.paired { white-space: normal; display: flex; flex-direction: column; gap: 0; }
     .pair-orig { color: var(--sub); font-size: 0.85em; white-space: pre-wrap; }
     .pair-trans { white-space: pre-wrap; }
     .pair-trans:not(.pair-same)::before { content: '→ '; color: var(--sub); }
-    .pair > .speaker { margin-bottom: 0.15em; }
+    .pair-time { font-size: 0.75em; color: var(--sub); font-variant-numeric: tabular-nums; margin-right: 0.4em; }
+    .pair .speaker { font-size: 0.75em; }
 
     /* History */
     .history-list { display: flex; flex-direction: column; gap: 0.6em; margin-top: 0.4em; }

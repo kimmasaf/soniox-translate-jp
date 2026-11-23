@@ -46,6 +46,8 @@ export interface SttOptions {
   model?: string
   /** Speaker label for the labeled stream (0-based order of appearance). */
   formatSpeaker?: (index: number) => string
+  /** Soniox context object (general / text / terms / translation_terms). */
+  context?: object
 }
 
 export interface SttSnapshot {
@@ -145,7 +147,7 @@ export function startSttStream(
     const s = spkIndex(spk)
     const last = pairs[pairs.length - 1]
     if (!last || last.same || last.trans || (s !== undefined && last.orig && last.speaker !== s)) {
-      pairs.push({ speaker: s, orig: text.trimStart(), trans: '', same: false })
+      pairs.push({ speaker: s, at: Date.now(), orig: text.trimStart(), trans: '', same: false })
     } else {
       last.orig += text
     }
@@ -157,13 +159,13 @@ export function startSttStream(
         return
       }
     }
-    pairs.push({ orig: '', trans: text.trimStart(), same: false })
+    pairs.push({ at: Date.now(), orig: '', trans: text.trimStart(), same: false })
   }
   function pairSame(text: string, spk?: string) {
     const s = spkIndex(spk)
     const last = pairs[pairs.length - 1]
     if (!last || !last.same || (s !== undefined && last.speaker !== s)) {
-      pairs.push({ speaker: s, orig: '', trans: text.trimStart(), same: true })
+      pairs.push({ speaker: s, at: Date.now(), orig: '', trans: text.trimStart(), same: true })
     } else {
       last.trans += text
     }
@@ -211,6 +213,7 @@ export function startSttStream(
       enable_endpoint_detection: true,
     }
     if (languageHints.length) config.language_hints = languageHints
+    if (opts.context) config.context = opts.context
     if (targetLang) {
       config.translation = { type: 'one_way', target_language: targetLang }
       config.enable_language_identification = true
@@ -320,7 +323,9 @@ export function startSttStream(
       console.info(
         `[soniox] connected — model ${model}` +
           (targetLang ? `, translate→${targetLang}` : '') +
-          (speakerLabels ? ', diarization on' : ''),
+          (speakerLabels ? ', diarization on' : '') +
+          (languageHints.length ? `, hints ${languageHints.join('/')}` : '') +
+          (opts.context ? `, context ${Object.keys(opts.context).join('/')}` : ''),
       )
       // Flush buffered audio captured during (re)connect.
       for (const chunk of pending) sock.send(chunk)

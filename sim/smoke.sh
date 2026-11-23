@@ -52,7 +52,7 @@ import -window root "$OUT/desktop-0-boot.png" 2>/dev/null || true
 c=0
 for xy in ${CLICKS:-}; do
   c=$((c+1))
-  if [ "$xy" = scroll ]; then xdotool mousemove 500 600 click --repeat 15 --delay 50 5   # wheel down
+  if [ "${xy#scroll}" != "$xy" ]; then xdotool mousemove 500 600 click --repeat "$(n=${xy#scroll}; echo ${n:-15})" --delay 50 5   # wheel down
   else xdotool mousemove ${xy%,*} ${xy#*,} click 1; fi
   sleep 1.5
   import -window root "$OUT/desktop-c$c.png" 2>/dev/null || true
@@ -95,7 +95,7 @@ done
 c=0
 for xy in ${POST_CLICKS:-}; do
   c=$((c+1))
-  if [ "$xy" = scroll ]; then xdotool mousemove 500 600 click --repeat 15 --delay 50 5
+  if [ "${xy#scroll}" != "$xy" ]; then xdotool mousemove 500 600 click --repeat "$(n=${xy#scroll}; echo ${n:-15})" --delay 50 5
   else xdotool mousemove ${xy%,*} ${xy#*,} click 1; fi
   sleep 2
   import -window root "$OUT/desktop-p$c.png" 2>/dev/null || true

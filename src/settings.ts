@@ -21,6 +21,16 @@ export interface AppSettings {
   displayMode: DisplayMode
   /** Language codes to keep as-is / NOT translate (the target is always kept). */
   noTranslateLangs: string[]
+  /** Soniox language_hints: languages likely to be spoken (bias only, others still recognized). */
+  languageHints: string[]
+  /** Soniox context (sent once per stream; improves names/terms and controls translations). */
+  ctxTopic: string
+  /** Terms to recognize/spell as written (one per line or comma separated). */
+  ctxTerms: string
+  /** Fixed translations, one "source=target" per line (map a name to itself to keep it). */
+  ctxTranslationTerms: string
+  /** Longer background text (description, agenda, notes). */
+  ctxText: string
   /** Newline per sentence (at . ? ! + Soniox pauses). */
   splitSentences: boolean
   /** Speaker diarization; labels are shown on the phone only (never on the glasses). */
@@ -42,6 +52,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   targetLang: 'ja',
   displayMode: 'split',
   noTranslateLangs: [],
+  languageHints: ['ja', 'en'],
+  ctxTopic: '',
+  ctxTerms: '',
+  ctxTranslationTerms: '',
+  ctxText: '',
   splitSentences: true,
   speakerLabels: false,
   align: 'left',
@@ -54,6 +69,37 @@ export const DEFAULT_SETTINGS: AppSettings = {
 /** Whether the layout has a separate original-language pane. */
 export function hasOriginalPane(mode: DisplayMode): boolean {
   return mode === 'split' || mode === 'split37'
+}
+
+/** Soniox context size limit is ~8,000 tokens (about 10,000 characters). */
+export const CONTEXT_MAX_CHARS = 9000
+
+export interface SonioxContext {
+  general?: { key: string; value: string }[]
+  text?: string
+  terms?: string[]
+  translation_terms?: { source: string; target: string }[]
+}
+
+/** Build the Soniox `context` object from settings (undefined when empty). */
+export function buildContext(s: AppSettings): SonioxContext | undefined {
+  const ctx: SonioxContext = {}
+  const topic = s.ctxTopic.trim()
+  if (topic) ctx.general = [{ key: 'topic', value: topic }]
+  const terms = s.ctxTerms.split(/[\n,、]+/).map(t => t.trim()).filter(Boolean)
+  if (terms.length) ctx.terms = terms
+  const tt = s.ctxTranslationTerms
+    .split('\n')
+    .map(line => line.split(/\s*(?:=|→|->)\s*/))
+    .filter(p => p.length === 2 && p[0].trim() && p[1].trim())
+    .map(([source, target]) => ({ source: source.trim(), target: target.trim() }))
+  if (tt.length) ctx.translation_terms = tt
+  const text = s.ctxText.trim()
+  if (text) ctx.text = text.slice(0, CONTEXT_MAX_CHARS)
+  // Keep the whole context under the API limit (an oversize context is rejected).
+  const over = JSON.stringify(ctx).length - CONTEXT_MAX_CHARS
+  if (over > 0 && ctx.text) ctx.text = ctx.text.slice(0, Math.max(0, ctx.text.length - over)) || undefined
+  return Object.keys(ctx).some(k => ctx[k as keyof SonioxContext] !== undefined) ? ctx : undefined
 }
 
 // Single localStorage key holding the JSON-serialized settings.

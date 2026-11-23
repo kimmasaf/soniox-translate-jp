@@ -94,6 +94,8 @@ ws.onopen = async () => {
   }
   if (LANG_HINTS.length) config.language_hints = LANG_HINTS
   if (TRANSLATE_TO) config.translation = { type: 'one_way', target_language: TRANSLATE_TO }
+  // SONIOX_CONTEXT='{"terms":["Kiro"],"translation_terms":[{"source":"demo","target":"デモ"}]}'
+  if (process.env.SONIOX_CONTEXT) config.context = JSON.parse(process.env.SONIOX_CONTEXT)
   ws.send(JSON.stringify(config))
 
   const CHUNK = 3200 // 100 ms
