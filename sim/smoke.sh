@@ -62,6 +62,14 @@ done
 n=0
 for f in ${AUDIO:-}; do
   n=$((n+1)); tag=$(basename "$f" .wav)
+  # "tap" in the AUDIO list = single tap on the glasses (pause/listen toggle).
+  if [ "$f" = tap ]; then
+    curl -sf -X POST $API/api/input -H 'Content-Type: application/json' --data '{"action":"click"}' >/dev/null
+    sleep 2.5
+    curl -sf $API/api/screenshot/glasses -o "$OUT/glasses-a$n-tap.png"
+    import -window root "$OUT/desktop-a$n-tap.png" 2>/dev/null || true
+    continue
+  fi
   kill $SILENCE_PID 2>/dev/null || true
   chunks=$(( $(stat -c %s "$f") / 3200 + 1 )); secs=$(( chunks / 10 ))
   echo "feeding $f (${secs}s)"

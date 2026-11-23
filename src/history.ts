@@ -1,6 +1,6 @@
-// Conversation history: each listening session is saved in Bilingual Paired
-// form via the SDK's per-user storage (kept inside the Even app on the phone),
-// and can be exported to the phone later as a text file.
+// Conversation history: each conversation is saved in Bilingual Paired form
+// via the SDK's per-user storage (kept inside the Even app on the phone), and
+// can be copied to the clipboard later from the phone's History screen.
 //
 // Layout: one small index key + one key per session, so autosaving the
 // current session never rewrites the whole history.
@@ -95,11 +95,6 @@ export function fmtDateTime(ms: number): string {
 export function fmtTime(ms: number): string {
   const d = new Date(ms)
   return `${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
-export function exportFileName(rec: SessionMeta): string {
-  const d = new Date(rec.start)
-  return `soniox_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}.txt`
 }
 
 export function exportText(rec: SessionRecord, formatSpeaker?: (i: number) => string): string {

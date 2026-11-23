@@ -6,7 +6,7 @@
 import { LANGUAGES, langName } from './languages'
 import { type AppSettings, type DisplayMode, DISPLAY_MODES, hasOriginalPane } from './settings'
 import type { PairView } from './paired'
-import { type SessionMeta, type SessionRecord, exportText, exportFileName, fmtDateTime, fmtTime } from './history'
+import { type SessionMeta, type SessionRecord, exportText, fmtDateTime, fmtTime } from './history'
 
 const MODE_LABEL: Record<DisplayMode, string> = {
   split: '上下分割(原文 2 行)',
@@ -15,9 +15,10 @@ const MODE_LABEL: Record<DisplayMode, string> = {
   translation: '翻訳のみ(全画面)',
 }
 
-type Status = 'connecting' | 'listening' | 'error' | 'setup' | 'reconnecting'
+type Status = 'connecting' | 'listening' | 'error' | 'setup' | 'reconnecting' | 'paused'
 
 const STATUS_LABEL: Record<Status, string> = {
+  paused: '一時停止中',
   connecting: '接続中',
   listening: '翻訳中',
   reconnecting: '再接続中',
@@ -104,7 +105,7 @@ export function mountUi({ settings, onSave, history }: UiHandlers) {
         <div class="card-head"><span class="card-title">原文</span></div>
         <div id="tx-body" class="card-body"></div>
       </section>
-      <p class="footnote">メガネのテンプルをダブルタップすると終了します</p>
+      <p class="footnote">メガネのテンプルをタップで開始/一時停止、ダブルタップで終了</p>
     </div>
 
     <div id="view-settings" class="view" hidden>
@@ -167,7 +168,7 @@ export function mountUi({ settings, onSave, history }: UiHandlers) {
         <h1>履歴</h1>
         <span class="bar-spacer"></span>
       </header>
-      <p class="section-foot">会話は対訳の形でこのスマートフォンのアプリ内に自動保存されます(最新 50 件)。「書き出す」でテキストファイルとして保存・共有できます。</p>
+      <p class="section-foot">会話は対訳の形でこのスマートフォンのアプリ内に自動保存されます(最新 50 件)。「コピー」で全文をクリップボードにコピーし、メモなどのアプリに貼り付けて保存できます。</p>
       <div id="history-list" class="history-list"></div>
       <button id="deleteAll" type="button" class="danger" hidden>すべて削除</button>
     </div>
@@ -265,7 +266,8 @@ export function mountUi({ settings, onSave, history }: UiHandlers) {
 export function setStatus(kind: Status, text: string) {
   if (!statusEl) return
   statusEl.className = `status status-${kind}`
-  statusTextEl.textContent = kind === 'listening' || kind === 'connecting' ? STATUS_LABEL[kind] : `${STATUS_LABEL[kind]}: ${text}`
+  statusTextEl.textContent =
+    kind === 'connecting' ? STATUS_LABEL[kind] : kind === 'error' || kind === 'setup' ? `${STATUS_LABEL[kind]}: ${text}` : `${STATUS_LABEL[kind]}(${text})`
   statusEl.title = text
 }
 
@@ -368,15 +370,11 @@ async function renderHistory(h: HistoryHandlers, listEl: HTMLElement, deleteAllE
     pv.textContent = m.preview
     const actions = document.createElement('div')
     actions.className = 'history-actions'
-    const exportBtn = button('書き出す', async () => {
-      const rec = await h.get(m.id)
-      if (rec) await exportFile(exportFileName(rec), exportText(rec, formatSpeaker), exportBtn)
-    })
     const copyBtn = button('コピー', async () => {
       const rec = await h.get(m.id)
       if (rec) await copyToClipboard(exportText(rec, formatSpeaker), copyBtn)
     })
-    actions.append(exportBtn, copyBtn)
+    actions.append(copyBtn)
     if (m.id !== cur) {
       const delBtn: HTMLButtonElement = button(
         '削除',
@@ -426,37 +424,7 @@ function button(label: string, onClick: () => void | Promise<void>, cls = 'text-
   return b
 }
 
-// Save a text file to the phone: the OS share sheet when available (lets the
-// user pick Files / AirDrop / mail …), otherwise a regular download.
-async function exportFile(name: string, text: string, btn: HTMLButtonElement) {
-  const flash = (msg: string) => {
-    const prev = btn.textContent
-    btn.textContent = msg
-    setTimeout(() => (btn.textContent = prev), 1800)
-  }
-  const file = new File([text], name, { type: 'text/plain;charset=utf-8' })
-  try {
-    if (navigator.canShare?.({ files: [file] })) {
-      await navigator.share({ files: [file], title: name })
-      return flash('書き出しました')
-    }
-  } catch (err) {
-    if ((err as DOMException)?.name === 'AbortError') return // user cancelled the sheet
-  }
-  try {
-    const url = URL.createObjectURL(file)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = name
-    document.body.append(a)
-    a.click()
-    a.remove()
-    setTimeout(() => URL.revokeObjectURL(url), 10_000)
-    flash('ダウンロードしました')
-  } catch {
-    flash('書き出せません。コピーを使ってください')
-  }
-}
+
 
 // Render text into a pane: "話者N: " line prefixes become label chips, the
 // interim (not yet final) tail is dimmed, and the pane sticks to the bottom.

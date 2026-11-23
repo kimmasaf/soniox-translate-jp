@@ -14,6 +14,9 @@ import type { SttSnapshot } from './asr/stt'
 // Glasses placeholders (the G2 font has kana/kanji but not symbols like ⚙).
 const PH_LISTEN = '聞き取り中…'
 const PH_TRANSLATE = '翻訳を待っています…'
+const PH_PAUSED = '一時停止中'
+const PH_PAUSED_START = '一時停止中です。\nタップすると聞き取りを開始します。'
+const PH_PAUSED_FOOTER = '- 一時停止中(タップで再開) -'
 import { type AppSettings, type DisplayMode, DISPLAY_MODES, SETTINGS_KEY, mergeSettings, hasOriginalPane } from './settings'
 import { type Pair, PAIR_LINE, withInterim, pairedGlassesText } from './paired'
 import { History, type SessionRecord } from './history'
@@ -238,11 +241,14 @@ function centerLine(line: string): string {
 // Paragraphs are separated by '\n' (line spacing applies between them); a
 // PAIR_LINE inside a paragraph breaks the line without adding a gap (used to
 // keep an original and its translation together in Bilingual Paired mode).
-function fitTail(text: string, placeholder: string, visibleLines: number, paneLines: number, split = settings.splitSentences): string {
+function fitTail(
+  text: string, placeholder: string, visibleLines: number, paneLines: number,
+  split = settings.splitSentences, footer = '',
+): string {
   let t = text.trim()
   let lines: string[]
   if (!t) {
-    lines = [placeholder]
+    lines = placeholder.split('\n')
   } else {
     if (split) t = splitSentences(t)
     const tail = t.length > 1400 ? t.slice(-1400) : t
@@ -258,6 +264,7 @@ function fitTail(text: string, placeholder: string, visibleLines: number, paneLi
     lines = out.slice(-visibleLines)
     while (lines.length && lines[0] === '') lines.shift() // no leading blank
   }
+  if (footer) lines.push(settings.align === 'center' ? centerLine(footer) : footer)
   if (settings.vAlign === 'bottom') {
     // Pad with single-space rows (guaranteed to render) so content sticks to
     // the bottom — the newest line stays at a fixed position.
@@ -268,14 +275,20 @@ function fitTail(text: string, placeholder: string, visibleLines: number, paneLi
 }
 
 function recomputeDisplay() {
-  if (hasTranscript) curTranscript = fitTail(rawTx, PH_LISTEN, transcriptLines, transcriptLines)
+  const phTop = paused ? PH_PAUSED : PH_LISTEN
+  if (hasTranscript) curTranscript = fitTail(rawTx, phTop, transcriptLines, transcriptLines)
   const visible = settings.maxLines > 0 ? Math.min(translationLines, settings.maxLines) : translationLines
-  if (settings.displayMode === 'paired') {
-    curTranslation = fitTail(rawPaired, PH_LISTEN, visible, translationLines, false)
+  const text = settings.displayMode === 'paired' ? rawPaired : settings.targetLang ? rawTl : rawTx
+  const split = settings.displayMode === 'paired' ? false : settings.splitSentences
+  if (paused) {
+    // Paused: keep the latest text, with a status line as the bottom row.
+    curTranslation = text.trim()
+      ? fitTail(text, '', Math.max(1, visible - 1), translationLines, split, PH_PAUSED_FOOTER)
+      : fitTail('', PH_PAUSED_START, visible, translationLines, split)
     return
   }
-  const primary = settings.targetLang ? rawTl : rawTx
-  curTranslation = fitTail(primary, settings.targetLang ? PH_TRANSLATE : PH_LISTEN, visible, translationLines)
+  const ph = settings.displayMode === 'paired' || !settings.targetLang ? PH_LISTEN : PH_TRANSLATE
+  curTranslation = fitTail(text, ph, visible, translationLines, split)
 }
 
 // ── Glasses render (debounced + coalesced; never overlapping) ────────────────
@@ -326,22 +339,45 @@ function forceRender() {
   scheduleGlassesRender()
 }
 
-// ── STT lifecycle ────────────────────────────────────────────────────────────
+// ── STT lifecycle (with pause) ───────────────────────────────────────────────
+// The app starts PAUSED. A single tap on the glasses toggles pause / listen.
+// Pausing turns the mic off and closes the Soniox stream (no usage while
+// paused). Resuming opens a new stream whose text is appended to what was
+// already shown ("carry"), so captions and the saved conversation continue.
 let stt: SttClient | null = null
 let micOn = false
+let paused = true
+
+interface Carry { tx: string; tl: string; txLab: string; tlLab: string; pairs: Pair[] }
+const emptyCarry = (): Carry => ({ tx: '', tl: '', txLab: '', tlLab: '', pairs: [] })
+let carry = emptyCarry() // everything from earlier streams of this conversation
+let live = emptyCarry() // carry + finals of the current stream
+
+/** Append a stream's text to carried text; a new stream starts on a new line. */
+function joinFinal(prev: string, final: string, interim: string): string {
+  if (!prev || !(final || interim)) return prev + final
+  return (prev.endsWith('\n') ? prev : prev + '\n') + final.replace(/^\s+/, '')
+}
 
 function onSnapshot(s: SttSnapshot) {
+  live = {
+    tx: joinFinal(carry.tx, s.transcriptFinal, s.transcriptInterim),
+    tl: joinFinal(carry.tl, s.translationFinal, s.translationInterim),
+    txLab: joinFinal(carry.txLab, s.transcriptLabeled, s.transcriptInterim),
+    tlLab: joinFinal(carry.tlLab, s.translationLabeled, s.translationInterim),
+    pairs: carry.pairs.concat(s.pairs),
+  }
   // Glasses: unlabeled text. Phone: speaker-labeled text.
-  rawTx = s.transcriptFinal + s.transcriptInterim
-  rawTl = s.translationFinal + s.translationInterim
-  const paired = withInterim(s.pairs, s.transcriptInterim, s.foreignTranslationInterim, s.sameInterim)
+  rawTx = live.tx + s.transcriptInterim
+  rawTl = live.tl + s.translationInterim
+  const paired = withInterim(live.pairs, s.transcriptInterim, s.foreignTranslationInterim, s.sameInterim)
   rawPaired = pairedGlassesText(paired)
   recomputeDisplay()
-  setTranscript(s.transcriptLabeled, s.transcriptInterim)
-  setTranslation(s.translationLabeled, s.translationInterim)
+  setTranscript(live.txLab, s.transcriptInterim)
+  setTranslation(live.tlLab, s.translationInterim)
   setPaired(paired)
   scheduleGlassesRender()
-  updateSession(s.pairs)
+  updateSession(live.pairs)
 }
 
 function onSttError(err: unknown) {
@@ -349,28 +385,20 @@ function onSttError(err: unknown) {
   console.error('STT error:', err)
 }
 
-function applySettings() {
+function stopStream() {
+  if (micOn) {
+    serial('audioOff', () => bridge.audioControl(false))
+    micOn = false
+  }
   stt?.close()
   stt = null
-  void flushSession() // the previous stream's conversation goes to history
-  session = null
-  setTargetLangLabel(settings.targetLang)
+}
 
-  if (!settings.apiKey) {
-    if (micOn) {
-      serial('audioOff', () => bridge.audioControl(false))
-      micOn = false
-    }
-    curTranscript = '設定が必要です'
-    curTranslation = 'スマートフォンでこのアプリを開き、設定画面で Soniox の API キーを入力してください。'
-    forceRender()
-    setStatus('setup', '設定画面で Soniox の API キーを入力してください')
-    return
-  }
-
+function startStream() {
+  if (stt || !settings.apiKey) return
   try {
     // Ignore late snapshots from a stream we already closed (it may still
-    // deliver its final "finished" message) so they don't leak into the new session.
+    // deliver its final "finished" message) so they don't leak into later text.
     let client: SttClient | null = null
     const onSnap = (s: SttSnapshot) => {
       if (client && stt === client) onSnapshot(s)
@@ -387,7 +415,8 @@ function applySettings() {
       onSnap,
       onSttError,
       status => {
-        if (status === 'live') setStatus('listening', 'マイク入力中・テンプルをダブルタップで終了')
+        if (paused) return
+        if (status === 'live') setStatus('listening', 'タップで一時停止・ダブルタップで終了')
         else if (status === 'connecting') setStatus('connecting', 'Soniox に接続中…')
         else if (status === 'reconnecting') setStatus('reconnecting', '接続が切れたため再接続しています')
       },
@@ -396,12 +425,55 @@ function applySettings() {
     onSttError(err)
     return
   }
-  startSession()
-
   if (!micOn) {
     serial('audioOn', () => bridge.audioControl(true))
     micOn = true
   }
+}
+
+function showPaused() {
+  setStatus('paused', 'メガネをタップすると聞き取りを開始します')
+  recomputeDisplay()
+  forceRender()
+}
+
+function pause() {
+  if (paused) return
+  paused = true
+  carry = live
+  stopStream()
+  void flushSession()
+  showPaused()
+}
+
+function resume() {
+  if (!paused || !settings.apiKey) return
+  paused = false
+  live = carry
+  recomputeDisplay()
+  forceRender()
+  startStream()
+}
+
+/** Start a new conversation with the current settings (keeps paused/listening). */
+function restart() {
+  stopStream()
+  void flushSession() // the previous conversation goes to history
+  session = null
+  carry = emptyCarry()
+  live = emptyCarry()
+  setTargetLangLabel(settings.targetLang)
+
+  if (!settings.apiKey) {
+    curTranscript = '設定が必要です'
+    curTranslation = 'スマートフォンでこのアプリを開き、設定画面で Soniox の API キーを入力してください。'
+    forceRender()
+    setStatus('setup', '設定画面で Soniox の API キーを入力してください')
+    return
+  }
+  startSession()
+  if (paused) showPaused()
+  else startStream()
 }
 
 async function handleSave(next: AppSettings) {
@@ -423,11 +495,10 @@ async function handleSave(next: AppSettings) {
     rawTx = ''
     rawTl = ''
     rawPaired = ''
-    curTranscript = PH_LISTEN
-    curTranslation = next.targetLang ? PH_TRANSLATE : PH_LISTEN
+    recomputeDisplay()
     if (needRebuild) await applyLayout()
     else forceRender()
-    applySettings()
+    restart()
   } else {
     if (needRebuild) await applyLayout()
     recomputeDisplay()
@@ -435,7 +506,7 @@ async function handleSave(next: AppSettings) {
   }
 }
 
-applySettings()
+restart()
 
 // ── Cleanup + event routing ──────────────────────────────────────────────────
 let cleanedUp = false
@@ -443,11 +514,11 @@ function cleanup() {
   if (cleanedUp) return
   cleanedUp = true
   void flushSession()
-  serial('audioOff', () => bridge.audioControl(false))
-  stt?.close()
+  stopStream()
   unsubscribe()
 }
 
+let lastTapAt = 0
 const unsubscribe = bridge.onEvenHubEvent(event => {
   const pcm = event.audioEvent?.audioPcm
   if (pcm) stt?.sendPcm(pcm)
@@ -461,20 +532,33 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
     return
   }
 
-  // Lifecycle — survive the 5-minute locked-phone test cleanly.
+  // Single tap → toggle pause / listen. CLICK_EVENT is 0, which protobuf/SDK
+  // may drop, so a tap can arrive as a textEvent or sysEvent with no
+  // eventType (the simulator sends {"sysEvent":{"eventSource":1}}).
+  const isClick = (t: OsEventTypeList | undefined) => t === OsEventTypeList.CLICK_EVENT || t === undefined
+  const isTap =
+    (event.textEvent && isClick(event.textEvent.eventType)) ||
+    (event.sysEvent && !event.sysEvent.imuData && isClick(event.sysEvent.eventType))
+  if (isTap) {
+    const now = Date.now()
+    if (now - lastTapAt < 400) return // one physical tap may arrive on two channels
+    lastTapAt = now
+    if (paused) resume()
+    else pause()
+    return
+  }
+
+  // Lifecycle — survive the 5-minute locked-phone test cleanly. Leaving the
+  // foreground stops the stream but keeps the listening state for return.
   if (sysType === OsEventTypeList.FOREGROUND_EXIT_EVENT) {
+    if (!paused) carry = live
+    stopStream()
     void flushSession()
-    if (micOn) {
-      serial('audioOff', () => bridge.audioControl(false))
-      micOn = false
-    }
-    stt?.close()
-    stt = null
     return
   }
   if (sysType === OsEventTypeList.FOREGROUND_ENTER_EVENT) {
     forceRender()
-    applySettings()
+    if (!paused) startStream()
     return
   }
 
